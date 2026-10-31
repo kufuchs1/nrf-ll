@@ -980,3 +980,68 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
     assert!(matches!(link.ended(101), Some(Ended::Terminated(0x13))));
     assert!(link.queue.iter().all(Option::is_none));
 }
+
+#[test]
+fn packets_of_one_event_wait_and_are_processed_in_order_after_it() {
+    let shared = Shared::new();
+    let mut link = connection();
+    let mut rx = [0; BUFFER_LEN];
+    let packets: [(u8, &[u8]); 3] =
+        [(Llid::Start.bits(), &[0xA1]), (Llid::Start.bits() | SN, &[0xA2]), (Llid::Control.bits(), &[OP_PING_REQ])];
+    for (header, payload) in packets {
+        rx[0] = header;
+        rx[1] = u8::try_from(payload.len()).unwrap();
+        rx[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        assert_eq!(link.receive(header, rx[1], true, 999, &shared), Some(true));
+        assert!(link.received);
+        link.stash(&rx, false);
+    }
+    // The host has room for two packets, both taken by the waiting ones:
+    // the next data packet is not acknowledged and comes again.
+    let nesn = link.nesn;
+    assert_eq!(link.receive(Llid::Start.bits() | SN, 1, true, 999, &shared), Some(true));
+    assert!(!link.received);
+    assert_eq!(link.nesn, nesn);
+    // Empty packets need no room.
+    link.nesn = !link.nesn;
+    assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &shared), Some(true));
+    assert!(link.received);
+    rx[0] = Llid::Continuation.bits();
+    rx[1] = 0;
+    link.stash(&rx, false);
+    assert_eq!(shared.acl_room(), 2);
+    link.process(&rx, false, &shared);
+    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA1));
+    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA2));
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PING_RSP));
+    assert_eq!(link.stats.received, 4);
+    assert!(link.pending.iter().all(Option::is_none));
+}
+
+#[test]
+fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.encryption.rx_on = true;
+    let mut rx = [0; BUFFER_LEN];
+    rx[0] = Llid::Start.bits();
+    rx[1] = 5;
+    link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
+    assert_eq!(link.receive(rx[0], 5, true, 999, &shared), Some(true));
+    link.stash(&rx, true);
+    assert_eq!(link.encryption.rx_counter, 1);
+    assert_eq!(link.pending[0].map(|packet| packet.bytes[3]), Some(0x42));
+}
+
+#[test]
+fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
+    let mut link = connection();
+    // The S1 byte in RAM is counted as well, which errs on the long side.
+    assert_eq!(link.exchange_us(), 3 * 336 + 450);
+    link.phy = Phy::M2;
+    link.tx_phy = Phy::M2;
+    assert_eq!(link.exchange_us(), 3 * 172 + 450);
+    link.phy = Phy::M1;
+    // Interval, widening, address, ramp-up, margin and processing time.
+    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 140 - 30 - 500);
+}

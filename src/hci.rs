@@ -633,6 +633,11 @@ impl Default for Shared {
 }
 
 impl Shared {
+    /// Free places for ACL data towards the host.
+    #[inline]
+    #[must_use = "the room is only read"]
+    pub fn acl_room(&self) -> usize { self.acl_in.free_capacity() }
+
     /// The advertising to run, if the host enabled it and no connection
     /// exists.
     #[inline]
@@ -919,6 +924,12 @@ impl Shared {
     /// Waits until the host passes something to the connection.
     #[inline]
     pub async fn wakeup(&self) { self.wakeup.wait().await; }
+
+    /// Takes the next ACL packet for the host, as its bytes.
+    #[cfg(test)]
+    pub(crate) fn take_acl_in(&self) -> Option<[u8; PACKET_MAX]> {
+        self.acl_in.try_receive().ok().map(|packet| packet.bytes)
+    }
 
     /// Shared state whose host enabled every event, as TrouBLE enables all
     /// the events this controller sends.

@@ -212,6 +212,24 @@ impl<'peripherals> Radio<'peripherals> {
         compiler_fence(Ordering::SeqCst);
     }
 
+    /// Points the radio at `buffer` for the reception that the shortcut after
+    /// the current transmission starts, and clears that transmission's
+    /// address, end and signal strength events. Call it once the
+    /// transmission ended, before the reception starts.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::set_buffer`].
+    #[inline]
+    pub unsafe fn rearm_receive(&mut self, buffer: *mut u8) {
+        // SAFETY: the caller upholds the contract of `set_buffer`.
+        let () = unsafe { self.set_buffer(buffer) };
+        REGS.events_address().write_value(0);
+        REGS.events_end().write_value(0);
+        REGS.events_rssiend().write_value(0);
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// Starts receiving now.
     #[inline]
     pub fn receive(&mut self) { REGS.tasks_rxen().write_value(1); }
@@ -331,7 +349,9 @@ impl<'peripherals> Radio<'peripherals> {
     pub fn transmit(&mut self) { REGS.tasks_txen().write_value(1); }
 
     /// Sleeps until an access address arrives or `expired` holds, which is
-    /// checked at least every 30.5 us. Returns whether the address arrived.
+    /// checked on every wake: it must depend on an event that wakes the CPU,
+    /// such as the deadline of [`crate::clock::Clock::expire_at`]. Returns
+    /// whether the address arrived.
     #[inline]
     pub fn wait_address<Expired>(&mut self, mut expired: Expired) -> bool
     where

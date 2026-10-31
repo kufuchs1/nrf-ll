@@ -3,7 +3,7 @@
 
 use super::{CHANNELS, LISTEN_US};
 use crate::{
-    clock::{Clock, reached},
+    clock::Clock,
     crypto,
     pdu::{
         ADV_ACCESS_ADDRESS,
@@ -413,7 +413,10 @@ fn on_channel(
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
     let deadline = clock.end_time().wrapping_add(LISTEN_US);
-    if !radio.wait_address(|| reached(clock.now(), deadline)) {
+    clock.expire_at(deadline);
+    let heard = radio.wait_address(|| clock.expired(deadline));
+    clock.stop_expiry();
+    if !heard {
         radio.disable();
         return None;
     }

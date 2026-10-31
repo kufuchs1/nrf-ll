@@ -37,6 +37,11 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   signal weakens or the central does not acknowledge a packet; after that it waits 64 packets before stepping down. A
   central that asked for a power has measured the device's signal itself, so the link layer never steps below that
   power on its own until the central asks for less. Advertising always uses 0 dBm.
+- **Connection events with several packets:** the event goes on while the central or the link layer has more data
+  (MD) and another exchange fits before the next event. Received payloads wait in plain text and are handled after
+  the event, so the answer within the 150 µs interframe space stays short. A control PDU, a CRC error, a payload
+  without room towards the host, a running encryption or termination procedure, or different PHYs per direction
+  close the event after the answer.
 - **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
   instant; data from the host ends the skipping at the next connection event. The receive window widens with the time
   since the last anchor, up to half the interval less the interframe space.
@@ -52,7 +57,10 @@ block runs with interrupts off and is retried after an abort, once the link laye
 
 The 32 MHz crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the time and
 restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside the link
-layer interrupt and wakes on the radio events, or at least every RTC tick (30.5 µs), instead of polling them. The RC
+layer interrupt and wakes only on the radio events and, for the end of a receive window, a TIMER0 compare, instead of
+polling them. Their interrupts stay disabled in the NVIC and only mark themselves pending, so keep the `RADIO` and
+`TIMER0` interrupts disabled there. Only the short waits for an RTC compare a few ticks ahead also wake on the RTC tick
+(30.5 µs). The RC
 oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
 once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
 `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable `TEMP` to

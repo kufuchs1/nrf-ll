@@ -40,7 +40,8 @@ const CC_ADDRESS: usize = 1;
 const CC_END: usize = 2;
 /// Capture register of [`Clock::now`] and of the RTC tick before sleeping.
 const CC_NOW: usize = 3;
-/// Compare register starting the radio (PPI channels 20 and 21).
+/// Compare register starting the radio (PPI channels 20 and 21), and once
+/// the radio started the deadline of a wait.
 const CC_START: usize = 0;
 /// Time after which a calibration whose crystal or end never came is given
 /// up until the next interval.
@@ -212,6 +213,26 @@ impl<'peripherals> Clock<'peripherals> {
         false
     }
 
+    /// Arms the compare event at `at` that wakes a sleep for a deadline,
+    /// with the TIMER0 interrupt enabled in the timer and disabled in the
+    /// NVIC. A pending radio start is cancelled; [`Self::stop_expiry`] ends
+    /// it.
+    #[inline]
+    pub fn expire_at(&self, at: u32) {
+        PPI.chenclr().write(|w| {
+            w.set_ch(PPI_TXEN, true);
+            w.set_ch(PPI_RXEN, true);
+        });
+        REGS.cc(CC_START).write_value(at.wrapping_sub(self.base));
+        REGS.events_compare(CC_START).write_value(0);
+        REGS.intenset().write(|w| w.set_compare(CC_START, true));
+    }
+
+    /// Whether the deadline `at` armed with [`Self::expire_at`] passed.
+    #[inline]
+    #[must_use = "the comparison is only computed"]
+    pub fn expired(&self, at: u32) -> bool { REGS.events_compare(CC_START).read() != 0 || reached(self.now(), at) }
+
     /// Waits until TIMER0 restarted at RTC tick `tick + ticks` and continues
     /// the time from `time` at `tick`.
     async fn finish_resume(&mut self, tick: u32, time: u32, ticks: u32) {
@@ -221,7 +242,7 @@ impl<'peripherals> Clock<'peripherals> {
         }
         let target = tick.wrapping_add(ticks) & RTC_MASK;
         let mut started_at = ticks;
-        sleep::until(|| RTC.events_compare(RTC_RESUME).read() != 0 || passed(target));
+        sleep::until_tick(|| RTC.events_compare(RTC_RESUME).read() != 0 || passed(target));
         if RTC.events_compare(RTC_RESUME).read() == 0 {
             REGS.tasks_start().write_value(1);
             started_at = rtc_now().wrapping_sub(tick) & RTC_MASK;
@@ -310,7 +331,7 @@ impl<'peripherals> Clock<'peripherals> {
             let tick = rtc_now().wrapping_add(RTC_MIN_TICKS) & RTC_MASK;
             RTC.cc(RTC_SYNC).write(|w| w.set_compare(tick));
             RTC.events_compare(RTC_SYNC).write_value(0);
-            sleep::until(|| RTC.events_compare(RTC_SYNC).read() != 0 || passed(tick));
+            sleep::until_tick(|| RTC.events_compare(RTC_SYNC).read() != 0 || passed(tick));
             if RTC.events_compare(RTC_SYNC).read() != 0 {
                 break tick;
             }
@@ -393,6 +414,13 @@ impl<'peripherals> Clock<'peripherals> {
         is_ahead(at.wrapping_sub(self.now()))
     }
 
+    /// Disarms the deadline of [`Self::expire_at`].
+    #[inline]
+    pub fn stop_expiry(&self) {
+        REGS.intenclr().write(|w| w.set_compare(CC_START, true));
+        REGS.events_compare(CC_START).write_value(0);
+    }
+
     /// Starts sending at `at`. Returns false if `at` is not in the future.
     #[inline]
     pub fn transmit_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_TXEN) }
@@ -407,6 +435,16 @@ impl<'peripherals> Clock<'peripherals> {
             }
         }
         CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
+    }
+
+    /// Sleeps until the radio start of [`Self::receive_at`] or
+    /// [`Self::transmit_at`] fired, which frees its compare for a deadline.
+    #[inline]
+    pub fn wait_started(&mut self) {
+        REGS.intenset().write(|w| w.set_compare(CC_START, true));
+        sleep::until(|| REGS.events_compare(CC_START).read() != 0);
+        REGS.intenclr().write(|w| w.set_compare(CC_START, true));
+        self.cancel_start();
     }
 
     /// Busy-waits until `at` for callers that require microsecond precision.
