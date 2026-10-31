@@ -17,7 +17,7 @@ embassy-futures = "0"
 embassy-nrf = { version = "0", features = ["nrf52832", "unstable-pac"] }
 embassy-sync = "0"
 embassy-time = "0"
-embedded-io = "0"
+embedded-io = "0.7"
 
 [dev-dependencies]
 aes = "0"
