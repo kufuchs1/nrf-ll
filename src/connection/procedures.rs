@@ -144,6 +144,10 @@ impl Connection {
     /// in [`HOST_REPLY_US`] has the request rejected. Without a host that
     /// decides, the link layer accepts any valid request.
     pub(super) fn drive_remote_request(&mut self, now: u32, shared: &Shared) {
+        if let Some(status) = self.merged_outcome.take() {
+            let params = self.current_params();
+            self.complete_updates(shared.take_merged_updates(), status, params, shared);
+        }
         let Some(request) = self.remote_request else { return };
         if request.asked.is_none() && !shared.host_decides_parameters() {
             // Any parameters the central proposes suit the device.
@@ -195,7 +199,11 @@ impl Connection {
                 self.enqueue(Llid::Control, &response);
                 self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             },
-            Err(reason) => self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]),
+            Err(reason) => {
+                self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]);
+                // Commands that were part of an answer the host withdrew.
+                self.merged_outcome = Some(reason);
+            },
         }
     }
 
@@ -406,7 +414,12 @@ impl Connection {
             },
             // The central ended its own request after our response, naming
             // the response as the specification says, or its request.
-            OP_CONNECTION_PARAM_REQ | OP_CONNECTION_PARAM_RSP => self.remote_update = None,
+            OP_CONNECTION_PARAM_REQ | OP_CONNECTION_PARAM_RSP => {
+                if self.remote_update.is_some() {
+                    self.merged_outcome = Some(error);
+                }
+                self.remote_update = None;
+            },
             _ => {},
         }
     }

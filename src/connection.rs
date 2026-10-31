@@ -514,6 +514,9 @@ pub struct Connection {
     length_request:         Request,
     /// Used data channels.
     map:                    UsedChannels,
+    /// Status for the LE Connection Update commands that were part of the
+    /// host's answer, once the central's request ended without an update.
+    merged_outcome:         Option<u8>,
     /// Next expected sequence number.
     nesn:                   bool,
     /// Transmit PHY to apply with the next PHY instant.
@@ -665,10 +668,11 @@ impl Connection {
             self.timeout = update.timeout;
             self.param_update = None;
             // The host learns of updates that change something or that it
-            // asked for (Core, Vol 6, Part B, 5.1.1).
-            if changed || update.requested {
-                self.notify(Packet::connection_update_complete(STATUS_SUCCESS, update.params), shared);
-            }
+            // asked for (Core, Vol 6, Part B, 5.1.1), once per LE Connection
+            // Update it sent: its own request, and those that were part of
+            // its answer to the central's request this update ends.
+            let owed = u8::from(update.requested).saturating_add(shared.take_merged_updates());
+            self.complete_updates(owed.max(u8::from(changed)), STATUS_SUCCESS, update.params, shared);
             if update.requested {
                 shared.finish_param_request();
             }
@@ -724,6 +728,20 @@ impl Connection {
             .wrapping_sub(RAMP_UP_US)
             .wrapping_sub(RX_MARGIN_US)
             .wrapping_sub(EVENT_GUARD_US)
+    }
+
+    /// Sends `count` LE Connection Update Complete events with `status` and
+    /// `params`: the first retained until delivered, any further one if the
+    /// host has room.
+    fn complete_updates(&mut self, count: u8, status: u8, params: ConnectionParams, shared: &Shared) {
+        for index in 0..count {
+            let event = Packet::connection_update_complete(status, params);
+            if index == 0 {
+                self.notify(event, shared);
+            } else {
+                _ = shared.try_push_event(event);
+            }
+        }
     }
 
     /// Advances the encryption start procedure with the host's answer.
@@ -1260,6 +1278,7 @@ impl Connection {
             pending: [None; RX_SLOTS],
             remote_request: None,
             remote_update: None,
+            merged_outcome: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),

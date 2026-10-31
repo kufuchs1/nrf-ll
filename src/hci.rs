@@ -578,6 +578,9 @@ struct HostState {
     legacy_enabled:    bool,
     /// A key reply is accepted only after an LTK request was queued.
     ltk_pending:       bool,
+    /// LE Connection Update commands the host sent while it answered a
+    /// central's request, each owed a complete event when that ends.
+    merged_updates:    u8,
     /// Authenticated payload timeout in units of 10 ms.
     payload_timeout:   u16,
     /// Accepted host PHY request, published after Command Status.
@@ -660,6 +663,7 @@ impl HostState {
             legacy: LegacySettings::new(),
             legacy_enabled: false,
             ltk_pending: false,
+            merged_updates: 0,
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             private_address: None,
             private_timeout: PRIVATE_ADDRESS_TIMEOUT,
@@ -981,6 +985,7 @@ impl Shared {
                 // Per link (Core, Vol 4, Part E, 7.3.94): every link starts
                 // with the default.
                 state.payload_timeout = DEFAULT_PAYLOAD_TIMEOUT;
+                state.merged_updates = 0;
             }
             state.connected = connected;
             if connected {
@@ -1056,9 +1061,23 @@ impl Shared {
     #[inline]
     pub fn take_disconnect(&self) -> Option<u8> { self.disconnect.try_take() }
 
+    /// Takes the next event for the host: its code and, for an LE meta
+    /// event, its subevent.
+    #[cfg(test)]
+    pub(crate) fn take_event_code(&self) -> Option<(u8, u8)> {
+        self.events.try_receive().ok().map(|event| (event.bytes[0], event.bytes[2]))
+    }
+
     /// Takes the host's answer to a long term key request.
     #[inline]
     pub fn take_ltk(&self) -> Option<Option<[u8; 16]>> { self.ltk.try_take() }
+
+    /// Takes the number of LE Connection Update commands that were part of
+    /// the host's answer to a central's request, each owed a complete event
+    /// now that the central's procedure ended.
+    pub(crate) fn take_merged_updates(&self) -> u8 {
+        self.state.lock(|cell| core::mem::take(&mut cell.borrow_mut().merged_updates))
+    }
 
     /// Takes connection parameters the host asks the central for.
     #[inline]
@@ -1389,27 +1408,22 @@ impl<'shared> Hci<'shared> {
             if !valid {
                 return STATUS_INVALID_PARAMETERS;
             }
-            // A central that asked for parameters itself, as it does while
-            // the host answers (TrouBLE's `ConnectionParamsRequest::accept`
-            // sends this command first), knows the procedure. The request
-            // waits until the central's update is in place; parameters it
-            // already meets complete it at once, others are asked for.
-            let central_asked = state.active_queries & QUERY_REMOTE_PARAMETERS != 0;
-            if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
-                if !central_asked {
-                    // One update at a time, as in Zephyr: a second request
-                    // would replace the first, whose complete event the host
-                    // then never gets.
-                    return STATUS_DISALLOWED;
-                }
-                // Part of the answer to the central: refused, the host would
-                // reject the central's request. A request not yet taken is
-                // replaced by these newer parameters; one under way is
-                // followed by them, and each completes with its own event.
-                self.shared.param_request.signal([min, max, latency, timeout]);
+            // While the host answers a central's request, as TrouBLE's
+            // `ConnectionParamsRequest::accept` does with this command first,
+            // the central's procedure carries the parameters: the command is
+            // part of the answer and completes when that procedure ends. It
+            // leaves the host's own update, if one runs, alone.
+            if state.active_queries & QUERY_REMOTE_PARAMETERS != 0 {
+                state.merged_updates = state.merged_updates.saturating_add(1);
                 return STATUS_SUCCESS;
             }
-            if state.remote_features & 0x02 == 0 && !central_asked {
+            // One update at a time, as in Zephyr: a second request would
+            // replace the first, whose complete event the host then never
+            // gets.
+            if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
+                return STATUS_DISALLOWED;
+            }
+            if state.remote_features & 0x02 == 0 {
                 return STATUS_UNSUPPORTED_REMOTE_FEATURE;
             }
             state.active_queries |= QUERY_CONNECTION_UPDATE;
@@ -2295,18 +2309,18 @@ mod tests {
         let update = [0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0];
         // Before the feature exchange LE Connection Update is refused...
         assert_eq!(hci.command_async(0x2013, &update), STATUS_UNSUPPORTED_REMOTE_FEATURE);
-        // ...but not as TrouBLE's accept of a central's request, which the
-        // link layer completes once the central's update is in place.
+        // ...but not as TrouBLE's accept of a central's request: part of the
+        // answer, owed a complete event when the central's procedure ends,
+        // also while an own update of the host runs.
         shared.ask_parameters();
         assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
-        assert_eq!(shared.take_param_request(), Some([6, 12, 0, 100]));
-        // Another accept while that update is still pending succeeds too
-        // and follows it with its own parameters.
-        let other = [0, 0, 24, 0, 40, 0, 0, 0, 100, 0, 0, 0, 0, 0];
-        assert_eq!(hci.command_async(0x2013, &other), STATUS_SUCCESS);
-        assert_eq!(shared.take_param_request(), Some([24, 40, 0, 100]));
-        // Without a central's request a second update is refused.
-        assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0]), STATUS_SUCCESS);
-        assert_eq!(hci.command_async(0x2013, &other), STATUS_DISALLOWED);
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
+        assert!(shared.take_param_request().is_none());
+        assert_eq!(shared.take_merged_updates(), 2);
+        assert_eq!(shared.take_merged_updates(), 0);
+        // Without a central's request a plain update needs the feature.
+        assert_eq!(hci.reply_parameters(0x2020, &update), STATUS_SUCCESS);
+        let other = update;
+        assert_eq!(hci.command_async(0x2013, &other), STATUS_UNSUPPORTED_REMOTE_FEATURE);
     }
 }

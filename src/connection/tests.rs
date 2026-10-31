@@ -1270,6 +1270,7 @@ fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_pl
     link.phy_request = Request::Done;
     link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
     link.drive_remote_request(0, &shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x06)));
     // TrouBLE's accept: LE Connection Update for the central's range, then
     // the reply. The central's periodicity is not repeated.
     assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
@@ -1281,12 +1282,31 @@ fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_pl
     // Nothing of ours starts while the central's update is pending.
     link.start_procedures(20, &shared);
     assert!(link.queue[0].is_none());
-    // The central's update arrives: interval 15 ms, latency 4, timeout 6 s.
-    link.remote_update = None;
-    link.interval = 12 * UNIT_1250_US;
-    link.latency = 4;
-    link.timeout = 600 * UNIT_10MS_US;
-    link.start_procedures(30, &shared);
-    assert!(link.queue[0].is_none());
-    assert_eq!(link.param_status, Some(STATUS_SUCCESS));
+    // The central's update: interval 20 units, latency 4, timeout 600, at
+    // event 6. At its instant the merged command completes, once.
+    link.handle_control(&[OP_CONNECTION_UPDATE_IND, 1, 0, 0, 20, 0, 4, 0, 0x58, 0x02, 6, 0], true);
+    assert!(link.remote_update.is_none());
+    link.counter = 6;
+    link.apply_instants(&shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
+    assert_eq!(shared.take_event_code(), None);
+    assert_eq!(shared.take_merged_updates(), 0);
+}
+
+#[test]
+fn a_merged_host_update_completes_with_the_central_rejection() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let hci = crate::hci::Hci::new(&shared);
+    let mut link = encrypted();
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    _ = shared.take_event_code();
+    assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    link.drive_remote_request(10, &shared);
+    link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_RSP, ERROR_INVALID_PARAMETERS], true);
+    link.drive_remote_request(20, &shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
+    assert_eq!(shared.take_event_code(), None);
 }

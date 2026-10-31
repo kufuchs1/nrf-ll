@@ -15,8 +15,9 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   control procedures a central starts. A host that enabled the LE remote connection parameter request event decides on
   the parameters a central asks for, with LE Remote Connection Parameter Request Reply or Negative Reply (TrouBLE's
   `connection-params-update` feature), and has them rejected if it does not answer in 30 s; otherwise the link layer
-  accepts any valid parameters. Our own procedures wait until the central's update arrives, and an LE Connection
-  Update the host sends while it answers (as TrouBLE's `accept` does) is part of that answer. Every packet
+  accepts any valid parameters. Our own procedures wait until the central's update arrives. An LE Connection
+  Update the host sends while it answers (as TrouBLE's `accept` does) is part of that answer: it leaves an own update
+  of the host alone and completes when the central's procedure ends, with the update or with the reason it ended. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
 - **Link end:** the host reads every packet the link acknowledged before it gets the disconnection complete event;
