@@ -7,9 +7,13 @@
 //! enabled in the peripheral but disabled in the NVIC only marks it pending,
 //! and that wakes the CPU without running a handler.
 //!
-//! The RTC0 TICK event wakes every sleep at least every 30.5 us, so a wait
-//! for a condition without an event of its own, such as a deadline, still
-//! ends close to it, and an event lost to a race cannot hang the link layer.
+//! Every wait ends on a peripheral event: a radio event, or for a deadline the
+//! TIMER0 compare that [`crate::clock::Clock::expire_at`] arms, so the CPU
+//! wakes once per event instead of on a periodic tick. The pending bits are
+//! cleared before the condition is checked and the CPU sleeps, so an event
+//! that comes in between still wakes it. Only the short waits for an RTC0
+//! compare a few ticks ahead use [`until_tick`], whose RTC0 TICK backstop
+//! ends a wait whose compare was written too late.
 
 use cortex_m::peripheral::SCB;
 use embassy_nrf::{
@@ -28,6 +32,7 @@ fn clear() {
     interrupt::RADIO.unpend();
     interrupt::RNG.unpend();
     interrupt::RTC0.unpend();
+    interrupt::TIMER0.unpend();
 }
 
 /// Lets pending interrupts wake `WFE`. Interrupts that are enabled in the
@@ -44,14 +49,11 @@ pub fn enable() {
     }
 }
 
-/// Sleeps until `ready` holds. `ready` must only depend on events whose
-/// interrupt is enabled in their peripheral, or on time.
-#[inline]
-pub fn until<Ready>(mut ready: Ready)
+/// Sleeps until `ready` holds, checking it on each wake.
+fn sleep<Ready>(mut ready: Ready)
 where
     Ready: FnMut() -> bool,
 {
-    RTC.intenset().write(|w| w.set_tick(true));
     while !ready() {
         clear();
         if ready() {
@@ -59,6 +61,29 @@ where
         }
         cortex_m::asm::wfe();
     }
+    clear();
+}
+
+/// Sleeps until `ready` holds. `ready` must only depend on events whose
+/// interrupt is enabled in their peripheral and disabled in the NVIC; one
+/// of them has to come.
+#[inline]
+pub fn until<Ready>(ready: Ready)
+where
+    Ready: FnMut() -> bool,
+{
+    sleep(ready);
+}
+
+/// Sleeps until `ready` holds, waking at least every RTC tick (30.5 us), for
+/// waits of a few ticks on RTC0 compares that may have been missed.
+#[inline]
+pub fn until_tick<Ready>(ready: Ready)
+where
+    Ready: FnMut() -> bool,
+{
+    RTC.intenset().write(|w| w.set_tick(true));
+    sleep(ready);
     RTC.intenclr().write(|w| w.set_tick(true));
     clear();
 }

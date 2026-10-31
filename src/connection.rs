@@ -144,6 +144,12 @@ const UNIT_1250_US: u32 = 1250;
 const VERSION: [u8; 5] = [0x0B, 0xFF, 0xFF, 0x00, 0x00];
 /// Fixed part of the window widening in microseconds.
 const WIDENING_FIXED_US: u32 = 16;
+/// Interframe space.
+const T_IFS_US: u32 = 150;
+/// Time left before the next event for processing the packets of this one.
+const EVENT_GUARD_US: u32 = 500;
+/// Received packets with a payload held for processing after the event.
+const RX_SLOTS: usize = 3;
 
 /// Why a connection ended.
 #[derive(Clone, Copy)]
@@ -287,6 +293,15 @@ enum Expect {
     },
 }
 
+/// A received PDU in plain text, waiting to be processed.
+#[derive(Clone, Copy)]
+struct Pending {
+    /// Header and payload.
+    bytes:     [u8; DATA_BUFFER_LEN],
+    /// Whether it came encrypted.
+    encrypted: bool,
+}
+
 /// A PDU waiting to be sent.
 #[derive(Clone, Copy)]
 struct Queued {
@@ -398,6 +413,9 @@ pub struct Connection {
     /// Time of the last packet with a valid MIC, once encrypted, and
     /// whether a ping asked for one since.
     payload_timer:          Option<(u32, bool)>,
+    /// Received packets with a payload, in order, waiting for processing
+    /// after the event.
+    pending:                [Option<Pending>; RX_SLOTS],
     /// PHY both ways.
     phy:                    Phy,
     /// The PHY update this side asks for.
@@ -406,6 +424,8 @@ pub struct Connection {
     phy_status:             Option<u8>,
     /// PHY change and its instant.
     phy_update:             Option<(Phy, u16)>,
+    /// Response deadline of our `LL_PING_REQ` (Core, Vol 6, Part B, 5.2).
+    ping_request:           Option<u32>,
     /// Transmit power control.
     power:                  [PowerControl; 2],
     /// PHY mask for which the peer has requested power control.
@@ -525,14 +545,40 @@ impl Connection {
             if changed || update.requested {
                 self.notify(Packet::connection_update_complete(STATUS_SUCCESS, update.params), shared);
             }
+            if update.requested {
+                shared.finish_param_request();
+            }
             info!("connection interval now {} us", update.interval);
         }
     }
 
+    /// Prepares the decryption of the next received packet, if the link is
+    /// encrypted. Returns false and ends the link if the counter ran out.
+    fn arm_decryption(&mut self, rx: &mut [u8; BUFFER_LEN]) -> bool {
+        if !self.encryption.rx_on {
+            return true;
+        }
+        if !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter) {
+            self.abort = Some(ERROR_MIC_FAILURE);
+            return false;
+        }
+        let pointers = (rx.as_mut_ptr(), self.rx_plain.as_mut_ptr());
+        let scratch = &mut self.encryption.scratch;
+        // SAFETY: the configuration, scratch and both buffers live in this
+        // connection or are borrowed for the exchange, which ends the
+        // decryption with `wait_decrypted`, `stop` or `disarm`.
+        let () = unsafe { crypto::arm_decrypt(&self.encryption.rx_config, pointers, scratch, self.phy) };
+        true
+    }
+
     /// Whether the current event can pass without listening: nothing to send
-    /// or acknowledge and no procedure running.
+    /// or acknowledge and no procedure running. As in Zephyr, latency also
+    /// stops while a connection or PHY update waits for its instant, so the
+    /// anchor is fresh when the timing or the PHY changes.
     fn can_skip(&self, shared: &Shared) -> bool {
         matches!(self.expect, Expect::Anchor)
+            && self.param_update.is_none()
+            && self.phy_update.is_none()
             && self.tx_kind == TxKind::Empty
             && self.queue.iter().all(Option::is_none)
             && self.terminate.is_none()
@@ -540,6 +586,19 @@ impl Connection {
             && self.encryption_change.is_none()
             && self.notifications.iter().all(Option::is_none)
             && !shared.has_acl_out()
+    }
+
+    /// Latest time an event that began at `anchor` may still exchange
+    /// packets: the next event's receive window opens no earlier than one
+    /// interval later, less its widening and setup.
+    fn close_by(&self, anchor: u32) -> u32 {
+        anchor
+            .wrapping_add(self.interval)
+            .wrapping_sub(self.widening(self.interval))
+            .wrapping_sub(self.phy.address_offset_us())
+            .wrapping_sub(RAMP_UP_US)
+            .wrapping_sub(RX_MARGIN_US)
+            .wrapping_sub(EVENT_GUARD_US)
     }
 
     /// Advances the encryption start procedure with the host's answer.
@@ -635,9 +694,12 @@ impl Connection {
         }
     }
 
-    /// Receives the central's packet of this event and answers it. Returns
-    /// its access address time, which sets the anchor even for a packet with
-    /// a CRC error or a retransmission (Core, Vol 6, Part B, 4.5.5).
+    /// Runs the connection event: receives the central's packets and
+    /// answers each, for as long as either side has more data and another
+    /// exchange fits before the next event (Core, Vol 6, Part B, 4.5.6).
+    /// Returns the access address time of the first packet, which sets the
+    /// anchor even for a packet with a CRC error or a retransmission (Core,
+    /// Vol 6, Part B, 4.5.5).
     fn exchange(
         &mut self,
         radio: &mut Radio<'_>,
@@ -647,18 +709,12 @@ impl Connection {
         shared: &Shared,
     ) -> Option<u32> {
         let asymmetric = self.phy != self.tx_phy;
-        radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit });
-        if self.encryption.rx_on {
-            if !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter) {
-                self.abort = Some(ERROR_MIC_FAILURE);
-                return None;
-            }
-            crypto::arm_decrypt(
-                &self.encryption.rx_config,
-                (rx.as_mut_ptr(), self.rx_plain.as_mut_ptr()),
-                &mut self.encryption.scratch,
-                self.phy,
-            );
+        // SAFETY: `rx` is a full packet buffer borrowed for this whole
+        // exchange, which disables the radio on every path out.
+        let () =
+            unsafe { radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit }) };
+        if !self.arm_decryption(rx) {
+            return None;
         }
         if !clock.receive_at(enable) {
             clock.cancel_start();
@@ -666,38 +722,104 @@ impl Connection {
             crypto::disarm();
             return None;
         }
-        if !radio.wait_address(|| reached(clock.now(), deadline)) {
-            clock.cancel_start();
+        clock.wait_started();
+        if !Self::wait_address(radio, clock, deadline) {
             radio.disable();
             crypto::disarm();
             return None;
         }
-        clock.cancel_start();
-        let address = clock.address_time();
-        radio.wait_end();
-        if self.respond(radio, rx, address, shared).is_none() {
-            radio.disable();
-            crypto::disarm();
-            return None;
-        }
-        radio.wait_disabled();
-        radio.set_turnaround(Turnaround::None);
-        if asymmetric {
-            radio.set_phy(self.tx_phy);
-            radio.set_fast_ramp(true);
-            if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
-                radio.set_fast_ramp(false);
+        let anchor = clock.address_time();
+        let close_by = self.close_by(anchor);
+        loop {
+            radio.wait_end();
+            let fits = !asymmetric && reached(close_by, clock.now().wrapping_add(self.exchange_us()));
+            let Some(more) = self.respond(radio, rx, clock.address_time(), fits, shared) else {
+                radio.disable();
                 crypto::disarm();
-                self.abort = Some(ERROR_HARDWARE_FAILURE);
                 return None;
+            };
+            radio.wait_disabled();
+            radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
+            if asymmetric {
+                radio.set_phy(self.tx_phy);
+                radio.set_fast_ramp(true);
+                if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
+                    radio.set_fast_ramp(false);
+                    crypto::disarm();
+                    self.abort = Some(ERROR_HARDWARE_FAILURE);
+                    return None;
+                }
+            }
+            radio.wait_end();
+            clock.cancel_start();
+            if !more {
+                break;
+            }
+            // The shortcut starts receiving once the transmission ends.
+            radio.wait_disabled();
+            radio.set_turnaround(Turnaround::Transmit);
+            // SAFETY: as for `prepare` above.
+            let () = unsafe { radio.rearm_receive(rx.as_mut_ptr()) };
+            let listen_until = clock
+                .end_time()
+                .wrapping_add(T_IFS_US)
+                .wrapping_add(self.phy.address_offset_us())
+                .wrapping_add(RX_TAIL_US);
+            if !self.arm_decryption(rx) || !Self::wait_address(radio, clock, listen_until) {
+                radio.disable();
+                crypto::disarm();
+                return Some(anchor);
             }
         }
-        radio.wait_end();
-        clock.cancel_start();
         radio.wait_disabled();
         radio.set_fast_ramp(false);
         crypto::disarm();
-        Some(address)
+        Some(anchor)
+    }
+
+    /// Air time of a full exchange after the current packet: our answer, and
+    /// one more packet each way, at their longest.
+    fn exchange_us(&self) -> u32 {
+        let packet = |phy: Phy| {
+            // Header, the longest payload with its MIC, and the CRC.
+            let bytes = u32::try_from(DATA_BUFFER_LEN).unwrap_or(u32::MAX).saturating_add(3);
+            phy.address_offset_us().saturating_add(bytes.saturating_mul(8).checked_div(phy.hci().into()).unwrap_or(0))
+        };
+        packet(self.tx_phy)
+            .saturating_mul(2)
+            .saturating_add(packet(self.phy))
+            .saturating_add(T_IFS_US.saturating_mul(3))
+    }
+
+    /// Updates the encryption phases and the anchor after an exchange whose
+    /// access address arrived at `address`.
+    fn exchanged(&mut self, address: u32) {
+        if self.encryption.phase == Phase::Starting
+            && self.tx_kind == TxKind::Control
+            && self.tx.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
+        {
+            self.encryption.rx_on = true;
+            self.encryption.phase = Phase::AwaitingStartResponse;
+        }
+        // After our encrypted pause response the central answers in
+        // plain text.
+        if self.encryption.phase == Phase::Pausing
+            && self.tx_kind == TxKind::Control
+            && self.tx.get(DATA_HEADER_LEN) == Some(&OP_PAUSE_ENC_RSP)
+        {
+            self.encryption.rx_on = false;
+            self.encryption.phase = Phase::AwaitingPauseResponse;
+        }
+        if matches!(self.expect, Expect::Anchor) {
+            let expected = self.expected_anchor();
+            let drift = address.wrapping_sub(expected).cast_signed();
+            if drift.unsigned_abs() >= self.drift.0.unsigned_abs() {
+                self.drift = (drift, self.widening(expected.wrapping_sub(self.anchor)));
+            }
+        }
+        self.anchor = address;
+        self.anchor_counter = self.counter;
+        self.expect = Expect::Anchor;
     }
 
     /// Access address time expected at the current event from the last
@@ -835,8 +957,8 @@ impl Connection {
                 self.enqueue(Llid::Control, &response);
             },
             OP_PING_REQ => self.enqueue(Llid::Control, &[OP_PING_RSP]),
-            OP_VERSION_IND | OP_LENGTH_RSP | OP_PING_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {
-            },
+            OP_PING_RSP => self.ping_request = None,
+            OP_VERSION_IND | OP_LENGTH_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {},
             _ => self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, code]),
         }
         info!("control {=u8:#04x}", code);
@@ -977,6 +1099,7 @@ impl Connection {
             param_status: None,
             param_update: None,
             payload_timer: None,
+            ping_request: None,
             phy: Phy::M1,
             tx_phy: Phy::M1,
             next_tx_phy: Phy::M1,
@@ -988,6 +1111,7 @@ impl Connection {
             report_at: end.wrapping_add(REPORT_INTERVAL_US),
             reported: (Stats::default(), 0),
             queue: [None; QUEUE_LEN],
+            pending: [None; RX_SLOTS],
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
@@ -1045,36 +1169,29 @@ impl Connection {
         }
     }
 
-    /// Passes the received PDU on and reports acknowledged ACL data.
+    /// Passes the packets received in the event on, in order, and reports
+    /// acknowledged ACL data.
     #[inline(never)]
     fn process(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
         self.flush_notifications(shared);
         if self.received {
-            self.received = false;
-            self.stats.received = self.stats.received.wrapping_add(1);
-            let mut plain = [0_u8; DATA_BUFFER_LEN];
-            // Empty PDUs have no MIC and need not produce a CCM output packet.
-            let source = if encrypted && rx.get(1) != Some(&0) { self.rx_plain.as_slice() } else { rx.as_slice() };
-            if let Some(bytes) = source.first_chunk::<DATA_BUFFER_LEN>() {
-                plain = *bytes;
-            }
-            let len = usize::from(plain.get(1).copied().unwrap_or_default());
-            if encrypted && len != 0 {
-                self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
-            }
-            let header = plain.first().copied().unwrap_or_default();
-            if len != 0 || header & MD != 0 {
-                self.skipped = self.latency;
-            }
-            let llid = header & LLID_MASK;
-            match plain.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(len)) {
-                Some(payload) if llid == Llid::Control.bits() => self.handle_control(payload, encrypted),
+            self.stash(rx, encrypted);
+        }
+        while let Some(mut packet) = self.pending.first_mut().and_then(Option::take) {
+            self.pending.rotate_left(1);
+            let [header, length, ..] = packet.bytes;
+            let len = usize::from(length);
+            match packet.bytes.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(len)) {
+                Some(payload) if header & LLID_MASK == Llid::Control.bits() => {
+                    self.handle_control(payload, packet.encrypted);
+                },
                 Some(payload) if len != 0 => {
-                    let kind = if llid == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
+                    let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
                     _ = shared.push_acl_in(Packet::acl(kind, payload));
                 },
                 Some(_) | None => {},
             }
+            crypto::wipe(&mut packet.bytes);
         }
         if let Some((status, enabled)) = self.encryption_change {
             let event = if self.encryption.procedure == Procedure::Refresh {
@@ -1127,8 +1244,12 @@ impl Connection {
         self.last_valid = address;
         self.establishment_deadline = None;
         self.acknowledge(header, shared)?;
-        let data = header & LLID_MASK != Llid::Control.bits() && len != 0;
-        if !duplicate && (!data || shared.has_room()) {
+        // A payload waits for processing after the event; data also needs
+        // room towards the host for itself and every packet before it.
+        let pending = self.pending.iter().flatten().count();
+        let data = header & LLID_MASK != Llid::Control.bits();
+        let room = len == 0 || (pending < RX_SLOTS && (!data || shared.acl_room() > pending));
+        if !duplicate && room {
             self.nesn = !self.nesn;
             self.received = true;
         }
@@ -1155,11 +1276,26 @@ impl Connection {
         self.report_at = self.report_at.wrapping_add(REPORT_INTERVAL_US);
     }
 
-    /// Acknowledges the received packet and selects and seals the answer.
-    /// Runs within the interframe space. A packet with a CRC error is
-    /// answered too, with the unacknowledged packet again (Core, Vol 6,
-    /// Part B, 4.5.6). Returns `None` if no answer may be sent.
-    fn respond(&mut self, radio: &mut Radio<'_>, rx: &[u8; BUFFER_LEN], address: u32, shared: &Shared) -> Option<()> {
+    /// Acknowledges the received packet, keeps a new one for processing
+    /// after the event, and selects and seals the answer. Runs within the
+    /// interframe space. A packet with a CRC error is answered too, with the
+    /// unacknowledged packet again (Core, Vol 6, Part B, 4.5.6). Returns
+    /// `None` if no answer may be sent, and otherwise whether the event goes
+    /// on after the answer: when either side has more data and `fits`, the
+    /// next exchange fits before the next event. A CRC error, a control PDU,
+    /// a packet without room, or a running encryption or termination
+    /// procedure closes it.
+    fn respond(
+        &mut self,
+        radio: &mut Radio<'_>,
+        rx: &[u8; BUFFER_LEN],
+        address: u32,
+        fits: bool,
+        shared: &Shared,
+    ) -> Option<bool> {
+        let mut open =
+            fits && self.encryption.phase == Phase::Idle && self.terminate.is_none() && self.terminated.is_none();
+        let mut central_more = false;
         if radio.crc_ok() {
             let header = rx.first().copied().unwrap_or_default();
             let len = rx.get(1).copied().unwrap_or_default();
@@ -1175,31 +1311,51 @@ impl Connection {
             if let Some(rssi) = radio.rssi() {
                 for_phy_mut(&mut self.power, self.tx_phy).on_packet(rssi);
             }
-            self.receive(header, len, mic_ok, address, shared)?;
+            let fresh = self.receive(header, len, mic_ok, address, shared)?;
+            central_more = header & MD != 0;
+            if self.received {
+                // A control PDU can change what the next packets mean: it
+                // is handled before the central sends more.
+                open &= header & LLID_MASK != Llid::Control.bits();
+                self.stash(rx, self.encryption.rx_on);
+            } else if fresh {
+                // No room for it: the central sends it again next event.
+                open = false;
+            } else {
+                // A retransmission acknowledges our packet only.
+            }
         } else {
             self.stats.crc_errors = self.stats.crc_errors.wrapping_add(1);
             // Its length may be corrupt: the decryption is not waited for.
             if self.encryption.rx_on {
                 crypto::stop();
             }
+            open = false;
         }
+        let ours_more = self.queue.iter().any(Option::is_some) || shared.has_acl_out();
         if let Some(tx_header) = self.tx.first_mut() {
-            let flags = if self.sn { SN } else { 0 } | if self.nesn { NESN } else { 0 };
+            let flags = if self.sn { SN } else { 0 }
+                | if self.nesn { NESN } else { 0 }
+                | if open && ours_more { MD } else { 0 };
             *tx_header = (*tx_header & LLID_MASK) | flags;
         }
         if self.encryption.tx_sealed {
-            crypto::arm_encrypt(
-                &self.encryption.tx_config,
-                (self.tx.as_ptr(), self.tx_sealed.as_mut_ptr()),
-                &mut self.encryption.scratch,
-                self.tx_phy,
-            );
-            radio.set_buffer(self.tx_sealed.as_mut_ptr());
+            let pointers = (self.tx.as_ptr(), self.tx_sealed.as_mut_ptr());
+            let scratch = &mut self.encryption.scratch;
+            // SAFETY: the configuration, scratch and buffers belong to this
+            // connection, which disarms the CCM before the exchange returns
+            // and wipes them only after the radio and the CCM stopped.
+            let () = unsafe { crypto::arm_encrypt(&self.encryption.tx_config, pointers, scratch, self.tx_phy) };
+            // SAFETY: as above; the exchange disables the radio before it
+            // returns.
+            let () = unsafe { radio.set_buffer(self.tx_sealed.as_mut_ptr()) };
         } else {
             crypto::disarm();
-            radio.set_buffer(self.tx.as_mut_ptr());
+            // SAFETY: the transmit buffer belongs to this connection, and the
+            // exchange disables the radio before it returns.
+            let () = unsafe { radio.set_buffer(self.tx.as_mut_ptr()) };
         }
-        Some(())
+        Some(open && (central_more || ours_more))
     }
 
     /// Runs connection events until the connection ends, exchanging data and
@@ -1276,6 +1432,11 @@ impl Connection {
                 self.skipped = self.latency;
             }
             clock.sleep_until(window.0, pending::<()>()).await;
+            if !clock.ensure_crystal().await && reached(clock.now(), window.0) {
+                self.stats.skipped = self.stats.skipped.wrapping_add(1);
+                self.counter = self.counter.wrapping_add(1);
+                continue;
+            }
             self.skipped = 0;
             radio.set_channel(channel);
             radio.set_phy(self.phy);
@@ -1283,32 +1444,7 @@ impl Connection {
             self.stats.events = self.stats.events.wrapping_add(1);
             let encrypted = self.encryption.rx_on;
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
-                if self.encryption.phase == Phase::Starting
-                    && self.tx_kind == TxKind::Control
-                    && self.tx.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
-                {
-                    self.encryption.rx_on = true;
-                    self.encryption.phase = Phase::AwaitingStartResponse;
-                }
-                // After our encrypted pause response the central answers in
-                // plain text.
-                if self.encryption.phase == Phase::Pausing
-                    && self.tx_kind == TxKind::Control
-                    && self.tx.get(DATA_HEADER_LEN) == Some(&OP_PAUSE_ENC_RSP)
-                {
-                    self.encryption.rx_on = false;
-                    self.encryption.phase = Phase::AwaitingPauseResponse;
-                }
-                if matches!(self.expect, Expect::Anchor) {
-                    let expected = self.expected_anchor();
-                    let drift = address.wrapping_sub(expected).cast_signed();
-                    if drift.unsigned_abs() >= self.drift.0.unsigned_abs() {
-                        self.drift = (drift, self.widening(expected.wrapping_sub(self.anchor)));
-                    }
-                }
-                self.anchor = address;
-                self.anchor_counter = self.counter;
-                self.expect = Expect::Anchor;
+                self.exchanged(address);
             } else {
                 self.note_miss(channel, window);
             }
@@ -1324,6 +1460,12 @@ impl Connection {
         crypto::disable();
         self.encryption.wipe();
         crypto::wipe(&mut self.rx_plain);
+        for packet in &mut self.pending {
+            if let Some(held) = packet.as_mut() {
+                crypto::wipe(&mut held.bytes);
+            }
+            *packet = None;
+        }
         crypto::wipe(&mut self.tx);
         crypto::wipe(&mut self.tx_sealed);
         radio.set_s1_included(false);
@@ -1414,10 +1556,51 @@ impl Connection {
         self.encryption.phase = Phase::AwaitingEntropy { rand, ediv };
     }
 
-    /// Window widening after `elapsed` microseconds since the last anchor.
+    /// Counts the new packet just accepted, and keeps one with a payload,
+    /// in plain text, for [`Self::process`] after the event. Its CCM
+    /// counter is used up at once, as the next packet of the event may be
+    /// decrypted before then.
+    fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool) {
+        self.received = false;
+        self.stats.received = self.stats.received.wrapping_add(1);
+        let mut bytes = [0_u8; DATA_BUFFER_LEN];
+        // Empty PDUs have no MIC and need not produce a CCM output packet.
+        let source = if encrypted && rx.get(1) != Some(&0) { self.rx_plain.as_slice() } else { rx.as_slice() };
+        if let Some(chunk) = source.first_chunk::<DATA_BUFFER_LEN>() {
+            bytes = *chunk;
+        }
+        let [header, len, ..] = bytes;
+        if encrypted && len != 0 {
+            self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
+        }
+        if len != 0 || header & MD != 0 {
+            self.skipped = self.latency;
+        }
+        if len != 0
+            && let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none())
+        {
+            *slot = Some(Pending { bytes, encrypted });
+        }
+        crypto::wipe(&mut bytes);
+    }
+
+    /// Sleeps until an access address arrives or `deadline` passes, woken by
+    /// a timer compare instead of polling. Returns whether one arrived.
+    fn wait_address(radio: &mut Radio<'_>, clock: &Clock<'_>, deadline: u32) -> bool {
+        clock.expire_at(deadline);
+        let heard = radio.wait_address(|| clock.expired(deadline));
+        clock.stop_expiry();
+        heard
+    }
+
+    /// Window widening after `elapsed` microseconds since the last anchor,
+    /// at most half the interval less the interframe space (Core, Vol 6,
+    /// Part B, 4.5.7), as Zephyr limits it: wider windows would overlap the
+    /// neighbouring events.
     fn widening(&self, elapsed: u32) -> u32 {
         let drift = u64::from(elapsed).saturating_mul(u64::from(self.sca_ppm)).div_ceil(1_000_000);
-        u32::try_from(drift).unwrap_or(u32::MAX).saturating_add(WIDENING_FIXED_US)
+        let limit = (self.interval >> 1_u32).saturating_sub(T_IFS_US);
+        u32::try_from(drift).unwrap_or(u32::MAX).saturating_add(WIDENING_FIXED_US).min(limit)
     }
 
     /// Radio start and access address deadline of the current event.

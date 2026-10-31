@@ -3,7 +3,7 @@
 
 use super::{CHANNELS, LISTEN_US};
 use crate::{
-    clock::{Clock, reached},
+    clock::Clock,
     crypto,
     pdu::{
         ADV_ACCESS_ADDRESS,
@@ -397,19 +397,26 @@ fn on_channel(
     radio.set_channel(channel);
     let listen = settings.kind != Kind::NonConnectable;
     let after = if listen { Turnaround::Receive } else { Turnaround::None };
-    radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after);
+    // SAFETY: the radio only reads the advertisement, which is borrowed for
+    // this event; every path out waits until the radio is disabled.
+    let () = unsafe { radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after) };
     radio.transmit();
     radio.wait_end();
     if !listen {
         radio.wait_disabled();
         return None;
     }
-    radio.set_buffer(rx.as_mut_ptr());
+    // SAFETY: `rx` is a full packet buffer borrowed for this event; every
+    // path out waits until the radio is disabled.
+    let () = unsafe { radio.set_buffer(rx.as_mut_ptr()) };
     radio.wait_disabled();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
     let deadline = clock.end_time().wrapping_add(LISTEN_US);
-    if !radio.wait_address(|| reached(clock.now(), deadline)) {
+    clock.expire_at(deadline);
+    let heard = radio.wait_address(|| clock.expired(deadline));
+    clock.stop_expiry();
+    if !heard {
         radio.disable();
         return None;
     }
@@ -420,7 +427,9 @@ fn on_channel(
         && let Some(scanner) = scan_request(rx, settings.own)
         && settings.accepts_scan(scanner)
     {
-        radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut());
+        // SAFETY: the radio only reads the scan response, borrowed for this
+        // event, and is disabled before it returns.
+        let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
         radio.wait_disabled();
         radio.set_turnaround(Turnaround::None);
         radio.wait_end();

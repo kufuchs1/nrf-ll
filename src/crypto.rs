@@ -42,8 +42,16 @@ pub const COUNTER_LIMIT: u64 = 1 << 39;
 
 /// Prepares the CCM to decrypt the next received packet from `input` into
 /// `output` while it is received.
+///
+/// # Safety
+///
+/// The CCM reads `config` and `input` and writes `output` and `scratch` by
+/// DMA after this returns. All four must stay valid, and the CPU must not
+/// access `output` or `scratch` while the CCM may, until the operation ends,
+/// [`disarm`], [`stop`] or [`disable`]. `input` and `output` must point to
+/// RAM holding [`crate::pdu::BUFFER_LEN`] bytes.
 #[inline]
-pub fn arm_decrypt(
+pub unsafe fn arm_decrypt(
     config: &[u8; CONFIG_LEN],
     (input, output): (*mut u8, *mut u8),
     scratch: &mut [u8; SCRATCH_LEN],
@@ -66,8 +74,16 @@ pub fn arm_decrypt(
 }
 
 /// Prepares the CCM to encrypt `input` into `output` while it is sent.
+///
+/// # Safety
+///
+/// The CCM reads `config` and `input` and writes `output` and `scratch` by
+/// DMA after this returns. All four must stay valid, and the CPU must not
+/// access `output` or `scratch` while the CCM may, until the operation ends,
+/// [`disarm`], [`stop`] or [`disable`]. `input` and `output` must point to
+/// RAM holding [`crate::pdu::BUFFER_LEN`] bytes.
 #[inline]
-pub fn arm_encrypt(
+pub unsafe fn arm_encrypt(
     config: &[u8; CONFIG_LEN],
     (input, output): (*const u8, *mut u8),
     scratch: &mut [u8; SCRATCH_LEN],

@@ -339,6 +339,18 @@ fn peripheral_latency_is_used_only_without_pending_work() {
     link.queue.fill(None);
     link.encryption.phase = Phase::Starting;
     assert!(!link.can_skip(&shared));
+    link.encryption.phase = Phase::Idle;
+    assert!(link.can_skip(&shared));
+    link.phy_update = Some((Phy::M2, 10));
+    assert!(!link.can_skip(&shared));
+}
+
+#[test]
+fn window_widening_stops_at_half_the_interval_less_the_interframe_space() {
+    let link = connection();
+    assert_eq!(link.interval, 15_000);
+    assert_eq!(link.widening(1_000_000), 1016);
+    assert_eq!(link.widening(60_000_000), 7350);
 }
 
 #[test]
@@ -597,6 +609,54 @@ fn the_peripheral_pings_before_the_authenticated_payload_timeout() {
     link.queue = [None; QUEUE_LEN];
     link.start_procedures(53_200_000, &shared);
     assert_eq!(link.payload_timer, Some((53_200_000, false)));
+}
+
+#[test]
+fn an_unanswered_ping_ends_the_link_after_the_procedure_timeout() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.payload_timer = Some((0, false));
+    link.start_procedures(23_000_000, &shared);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PING_REQ));
+    // Other authenticated traffic does not answer the ping, and no second
+    // ping starts while it runs.
+    assert_eq!(link.receive(Llid::Control.bits() | NESN, 5, true, 23_100_000, &shared), Some(true));
+    link.queue = [None; QUEUE_LEN];
+    link.start_procedures(46_000_000, &shared);
+    assert!(link.queue[0].is_none());
+    assert!(link.abort.is_none());
+    link.start_procedures(63_000_000, &shared);
+    assert_eq!(link.abort, Some(ERROR_RESPONSE_TIMEOUT));
+}
+
+#[test]
+fn a_ping_response_ends_the_ping_procedure() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.ping_request = Some(1000);
+    link.handle_control(&[OP_PING_RSP], true);
+    assert!(link.ping_request.is_none());
+    link.ping_request = Some(1000);
+    link.handle_rejection(OP_UNKNOWN_RSP, &[OP_PING_REQ]);
+    assert!(link.ping_request.is_none());
+    link.start_procedures(2000, &shared);
+    assert!(link.abort.is_none());
+}
+
+#[test]
+fn an_expired_payload_timeout_waits_for_room_in_the_event_queue() {
+    let shared = Shared::with_all_events();
+    let mut link = encrypted();
+    link.payload_timer = Some((0, true));
+    while shared.try_push_event(Packet::completed_packets(1)) {}
+    link.start_procedures(31_000_000, &shared);
+    assert!(link.notifications.iter().flatten().any(Packet::is_payload_timeout));
+    // It is not queued twice while it waits.
+    link.payload_timer = Some((0, true));
+    link.start_procedures(62_000_000, &shared);
+    assert_eq!(link.notifications.iter().flatten().filter(|event| event.is_payload_timeout()).count(), 1);
 }
 
 #[test]
@@ -919,4 +979,69 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
     link.handle_control(&[OP_TERMINATE_IND, 0x13], false);
     assert!(matches!(link.ended(101), Some(Ended::Terminated(0x13))));
     assert!(link.queue.iter().all(Option::is_none));
+}
+
+#[test]
+fn packets_of_one_event_wait_and_are_processed_in_order_after_it() {
+    let shared = Shared::new();
+    let mut link = connection();
+    let mut rx = [0; BUFFER_LEN];
+    let packets: [(u8, &[u8]); 3] =
+        [(Llid::Start.bits(), &[0xA1]), (Llid::Start.bits() | SN, &[0xA2]), (Llid::Control.bits(), &[OP_PING_REQ])];
+    for (header, payload) in packets {
+        rx[0] = header;
+        rx[1] = u8::try_from(payload.len()).unwrap();
+        rx[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        assert_eq!(link.receive(header, rx[1], true, 999, &shared), Some(true));
+        assert!(link.received);
+        link.stash(&rx, false);
+    }
+    // The host has room for two packets, both taken by the waiting ones:
+    // the next data packet is not acknowledged and comes again.
+    let nesn = link.nesn;
+    assert_eq!(link.receive(Llid::Start.bits() | SN, 1, true, 999, &shared), Some(true));
+    assert!(!link.received);
+    assert_eq!(link.nesn, nesn);
+    // Empty packets need no room.
+    link.nesn = !link.nesn;
+    assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &shared), Some(true));
+    assert!(link.received);
+    rx[0] = Llid::Continuation.bits();
+    rx[1] = 0;
+    link.stash(&rx, false);
+    assert_eq!(shared.acl_room(), 2);
+    link.process(&rx, false, &shared);
+    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA1));
+    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA2));
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PING_RSP));
+    assert_eq!(link.stats.received, 4);
+    assert!(link.pending.iter().all(Option::is_none));
+}
+
+#[test]
+fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.encryption.rx_on = true;
+    let mut rx = [0; BUFFER_LEN];
+    rx[0] = Llid::Start.bits();
+    rx[1] = 5;
+    link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
+    assert_eq!(link.receive(rx[0], 5, true, 999, &shared), Some(true));
+    link.stash(&rx, true);
+    assert_eq!(link.encryption.rx_counter, 1);
+    assert_eq!(link.pending[0].map(|packet| packet.bytes[3]), Some(0x42));
+}
+
+#[test]
+fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
+    let mut link = connection();
+    // The S1 byte in RAM is counted as well, which errs on the long side.
+    assert_eq!(link.exchange_us(), 3 * 336 + 450);
+    link.phy = Phy::M2;
+    link.tx_phy = Phy::M2;
+    assert_eq!(link.exchange_us(), 3 * 172 + 450);
+    link.phy = Phy::M1;
+    // Interval, widening, address, ramp-up, margin and processing time.
+    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 140 - 30 - 500);
 }

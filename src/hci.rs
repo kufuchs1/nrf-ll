@@ -85,6 +85,8 @@ const LE_LTK_REQUEST: u8 = 0x05;
 
 /// Status: success.
 const STATUS_SUCCESS: u8 = 0x00;
+/// Bit of an accepted LE Connection Update awaiting its complete event.
+const QUERY_CONNECTION_UPDATE: u8 = 0x08;
 /// Status: unknown command.
 const STATUS_UNKNOWN_COMMAND: u8 = 0x01;
 /// Status: unknown connection identifier.
@@ -363,6 +365,9 @@ impl Packet {
         self.bytes.first() == Some(&EVENT_LE_META) && self.bytes.get(2) == Some(&LE_CONNECTION_UPDATE_COMPLETE)
     }
 
+    /// Whether this is an authenticated payload timeout event.
+    pub(crate) fn is_payload_timeout(&self) -> bool { self.bytes.first() == Some(&EVENT_PAYLOAD_TIMEOUT_EXPIRED) }
+
     /// Whether this is a retained PHY update completion.
     pub(crate) fn is_phy_update(&self) -> bool {
         self.bytes.first() == Some(&EVENT_LE_META) && self.bytes.get(2) == Some(&LE_PHY_UPDATE_COMPLETE)
@@ -628,6 +633,11 @@ impl Default for Shared {
 }
 
 impl Shared {
+    /// Free places for ACL data towards the host.
+    #[inline]
+    #[must_use = "the room is only read"]
+    pub fn acl_room(&self) -> usize { self.acl_in.free_capacity() }
+
     /// The advertising to run, if the host enabled it and no connection
     /// exists.
     #[inline]
@@ -657,6 +667,10 @@ impl Shared {
         while self.events.try_receive().is_ok() {}
         self.reset_done.signal(());
     }
+
+    /// Lets the host start another connection update once the current one
+    /// reported its outcome.
+    pub(crate) fn finish_param_request(&self) { self.complete_query(QUERY_CONNECTION_UPDATE); }
 
     /// Whether ACL data from the host waits for the air.
     #[inline]
@@ -910,6 +924,12 @@ impl Shared {
     /// Waits until the host passes something to the connection.
     #[inline]
     pub async fn wakeup(&self) { self.wakeup.wait().await; }
+
+    /// Takes the next ACL packet for the host, as its bytes.
+    #[cfg(test)]
+    pub(crate) fn take_acl_in(&self) -> Option<[u8; PACKET_MAX]> {
+        self.acl_in.try_receive().ok().map(|packet| packet.bytes)
+    }
 
     /// Shared state whose host enabled every event, as TrouBLE enables all
     /// the events this controller sends.
@@ -1184,12 +1204,17 @@ impl<'shared> Hci<'shared> {
         else {
             return STATUS_INVALID_PARAMETERS;
         };
-        let (connected, features) = self.shared.state.lock(|cell| {
+        let (connected, features, busy) = self.shared.state.lock(|cell| {
             let state = cell.borrow();
-            (state.connected, state.remote_features)
+            (state.connected, state.remote_features, state.active_queries & QUERY_CONNECTION_UPDATE != 0)
         });
         if !connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
             return STATUS_UNKNOWN_CONNECTION;
+        }
+        // One update at a time, as in Zephyr: a second request would replace
+        // the first, whose complete event the host then never gets.
+        if busy {
+            return STATUS_DISALLOWED;
         }
         if features & 0x02 == 0 {
             return STATUS_UNSUPPORTED_REMOTE_FEATURE;
@@ -1199,6 +1224,7 @@ impl<'shared> Hci<'shared> {
         if min > max || !valid_connection_parameters(max, latency, timeout, 1, 0) || min < 6 {
             return STATUS_INVALID_PARAMETERS;
         }
+        self.shared.state.lock(|cell| cell.borrow_mut().active_queries |= QUERY_CONNECTION_UPDATE);
         self.shared.param_request.signal([min, max, latency, timeout]);
         self.shared.wakeup.signal(());
         STATUS_SUCCESS
@@ -1546,6 +1572,25 @@ mod tests {
         assert_eq!(&event.bytes[..6], &[14, 4, 1, 3, 12, 0]);
         assert!(shared.events.try_receive().is_err());
         assert!(!shared.state.lock(|cell| cell.borrow().connected));
+    }
+
+    #[test]
+    fn a_second_connection_update_waits_for_the_first_to_complete() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        shared.set_remote_features(0x02);
+        let hci = Hci::new(&shared);
+        let update = [0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0];
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_DISALLOWED);
+        assert_eq!(shared.take_param_request(), Some([6, 12, 0, 100]));
+        shared.finish_param_request();
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
+        // A link that ends forgets the request.
+        shared.set_connected(false);
+        shared.set_connected(true);
+        shared.set_remote_features(0x02);
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
     }
 
     #[test]
