@@ -230,7 +230,9 @@ fn new_authenticated_packet_acknowledges_acl() {
 
 #[test]
 fn malformed_data_packets_fail_closed() {
-    for (header, len, encrypted) in [(0, 1, false), (2, 0, false), (3, 0, true), (2, 28, false), (2, 32, true)] {
+    // Payloads up to 251 octets fit the receive buffer, whatever the
+    // negotiated length; with a MIC no length field can exceed it.
+    for (header, len, encrypted) in [(0, 1, false), (2, 0, false), (3, 0, true), (2, 252, false)] {
         let mut link = connection();
         link.encryption.rx_on = encrypted;
         assert_eq!(link.receive(header, len, true, 999, &Shared::new()), None);
@@ -1039,11 +1041,18 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
 #[test]
 fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     let mut link = connection();
-    // The S1 byte in RAM is counted as well, which errs on the long side.
-    assert_eq!(link.exchange_us(), 3 * 336 + 450);
+    // 27 octets without a MIC; the S1 byte in RAM is counted as well,
+    // which errs on the long side.
+    assert_eq!(link.exchange_us(), 3 * (40 + 33 * 8) + 450);
     link.phy = Phy::M2;
     link.tx_phy = Phy::M2;
-    assert_eq!(link.exchange_us(), 3 * 172 + 450);
+    assert_eq!(link.exchange_us(), 3 * (24 + 33 * 4) + 450);
+    // 251 octets with a MIC each way.
+    link.length = DataLength::new(LENGTH_MAX);
+    link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    link.encryption.tx_on = true;
+    link.encryption.rx_on = true;
+    assert_eq!(link.exchange_us(), 3 * (24 + 261 * 4) + 450);
     link.phy = Phy::M1;
     // Interval, widening, address, ramp-up, margin and processing time.
     assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 40 - 30 - 500);
@@ -1083,4 +1092,85 @@ fn a_host_that_does_not_answer_has_the_request_rejected() {
         link.queue[0].map(|queued| queued.data[..3] == [OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, 0x3B]),
         Some(true)
     );
+}
+
+#[test]
+fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    assert_eq!(link.tx_payload_max(), 27);
+    // The central receives and sends 251 octets in 2120 us.
+    link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
+    let response = link.queue[0].unwrap();
+    // We receive 251 octets but send only what the host allowed so far.
+    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 27, 0, 0x48, 0x01]);
+    assert_eq!(link.length.effective(), [27, 328, 251, 2120]);
+    link.drive_length(&shared);
+    assert_eq!(link.length.reported, [27, 328, 251, 2120]);
+    assert!(link.notifications.iter().all(Option::is_none));
+    // The host lets the link send 251 octets: the procedure runs again.
+    shared.set_connected(true);
+    assert_eq!(crate::hci::Hci::new(&shared).set_data_length(&[0, 0, 251, 0, 0x48, 0x08]), 0);
+    link.length_request = Request::Done;
+    link.drive_length(&shared);
+    assert!(link.length_request == Request::NotStarted);
+    assert_eq!(link.tx_payload_max(), 251);
+    // Encrypted on LE 1M, 2120 us still hold 251 octets with the MIC; a
+    // central that receives in 1000 us gets at most 107.
+    link.encryption.tx_on = true;
+    assert_eq!(link.tx_payload_max(), 251);
+    link.length.take_peer(&[251, 0, 0xE8, 0x03, 251, 0, 0x48, 0x08]);
+    assert_eq!(link.tx_payload_max(), 1000 / 8 - 10 - 4);
+    // On LE 2M the same time holds twice the octets, less the overhead.
+    link.tx_phy = Phy::M2;
+    assert_eq!(link.tx_payload_max(), 1000 / 4 - 11 - 4);
+}
+
+#[test]
+fn host_data_is_sent_in_fragments_the_central_receives() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let mut link = connection();
+    let mut data = [0; ACL_MAX];
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = u8::try_from(index).unwrap();
+    }
+    assert!(shared.queue_acl_for_test(&data[..60]));
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::AclPart);
+    assert_eq!(link.tx[..3], [Llid::Start.bits(), 27, 0]);
+    assert_eq!(link.tx[3..30], data[..27]);
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::AclPart);
+    assert_eq!(link.tx[..3], [Llid::Continuation.bits(), 27, 0]);
+    assert_eq!(link.tx[3..30], data[27..54]);
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::Acl);
+    assert_eq!(link.tx[..3], [Llid::Continuation.bits(), 6, 0]);
+    assert_eq!(link.tx[3..9], data[54..60]);
+    // Only the last fragment completes the host's packet.
+    link.tx_kind = TxKind::AclPart;
+    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    assert_eq!(link.completed, 0);
+}
+
+#[test]
+fn the_link_asks_for_a_longer_data_length_only_when_the_host_allows_it() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.central_features = Some([0x3F, 0, 0, 0, 0, 0, 0, 0]);
+    link.start_procedures(0, &shared);
+    assert!(link.queue[0].is_none());
+    link.length.local_tx = LENGTH_MAX;
+    link.start_procedures(0, &shared);
+    assert_eq!(
+        link.queue[0].map(|queued| queued.data[..9] == [OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]),
+        Some(true)
+    );
+    assert!(matches!(link.length_request, Request::Requested(_)));
+    link.handle_control(&[OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], true);
+    assert!(link.length_request == Request::Done);
+    assert_eq!(link.length.effective(), [251, 2120, 251, 2120]);
 }

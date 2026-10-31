@@ -10,12 +10,14 @@ use super::{
     ERROR_UNACCEPTABLE_PARAMETERS,
     ERROR_UNSUPPORTED_FEATURE,
     ERROR_UNSUPPORTED_VALUE,
+    FEATURE_DATA_LENGTH,
     FEATURES,
     HOST_REPLY_US,
     OP_CONNECTION_PARAM_REQ,
     OP_CONNECTION_PARAM_RSP,
     OP_CONNECTION_UPDATE_IND,
     OP_FEATURE_RSP,
+    OP_LENGTH_REQ,
     OP_PERIPHERAL_FEATURE_REQ,
     OP_PHY_REQ,
     OP_PHY_RSP,
@@ -40,7 +42,7 @@ use super::{
 };
 use crate::{
     clock::reached,
-    hci::{ConnectionParams, Packet, Shared},
+    hci::{ConnectionParams, LENGTH_DEFAULT, Packet, Shared},
     log::info,
     pdu::{Llid, field, valid_connection_parameters},
     power_control::LEVELS_DBM,
@@ -119,6 +121,24 @@ impl Connection {
             self.latency,
             u16::try_from(self.timeout.checked_div(UNIT_10MS_US).unwrap_or(0)).unwrap_or(u16::MAX),
         )
+    }
+
+    /// Applies a data length the host set for the link, which starts the
+    /// procedure again, and tells the host of changed effective lengths
+    /// (LE Data Length Change).
+    pub(super) fn drive_length(&mut self, shared: &Shared) {
+        if let Some(length) = shared.take_data_length() {
+            self.length.local_tx = length;
+            if !matches!(self.length_request, Request::Requested(_)) {
+                self.length_request = Request::NotStarted;
+            }
+        }
+        let effective = self.length.effective();
+        if effective != self.length.reported {
+            self.length.reported = effective;
+            self.notify(Packet::data_length_change(effective), shared);
+            info!("data length now {} octets out, {} in", effective[0], effective[2]);
+        }
     }
 
     /// Asks the host about a central's connection parameter request and
@@ -370,6 +390,7 @@ impl Connection {
                 }
             },
             OP_PING_REQ => self.ping_request = None,
+            OP_LENGTH_REQ => self.length_request = Request::Done,
             OP_CONNECTION_PARAM_REQ if self.param_request.is_some() => {
                 self.param_request = None;
                 self.param_status = Some(error);
@@ -405,7 +426,7 @@ impl Connection {
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
             return;
         }
-        if [self.features_request, self.phy_request]
+        if [self.features_request, self.phy_request, self.length_request]
             .iter()
             .any(|request| matches!(request, Request::Requested(deadline) if reached(now, *deadline)))
         {
@@ -419,9 +440,10 @@ impl Connection {
             && self.queue.iter().all(Option::is_none)
             && self.notifications.iter().all(Option::is_none)
             && self.remote_request.is_none();
-        let ours_running =
-            [self.features_request, self.phy_request].iter().any(|request| matches!(request, Request::Requested(_)))
-                || self.param_request.is_some();
+        let ours_running = [self.features_request, self.phy_request, self.length_request]
+            .iter()
+            .any(|request| matches!(request, Request::Requested(_)))
+            || self.param_request.is_some();
         if !idle || ours_running {
             return;
         }
@@ -443,6 +465,14 @@ impl Connection {
             let [tx, rx] = self.preferred_phys;
             self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
             self.phy_request = Request::Requested(deadline);
+        } else if self.length_request == Request::NotStarted
+            && self.length.local_tx != LENGTH_DEFAULT
+            && self.central_features.is_some_and(|[first, ..]| first & FEATURE_DATA_LENGTH != 0)
+        {
+            // The host lets this side send longer packets than the default:
+            // the central learns it, and of the longest this side receives.
+            self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_REQ));
+            self.length_request = Request::Requested(deadline);
         } else if let Some([min, max, latency, timeout]) = shared.take_param_request() {
             let current = self.current_params();
             if (min..=max).contains(&current.interval) && latency == current.latency && timeout == current.timeout {

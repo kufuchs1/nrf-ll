@@ -27,6 +27,13 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   an LL response timeout, as any other procedure does.
 - **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
   previous one reported its LE Connection Update Complete event.
+- **Data length extension:** payloads of up to 251 octets each way instead of 27. The link layer receives 251 octets
+  from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer packets once the host allows them for
+  the link (LE Set Data Length, TrouBLE's `Connection::update_data_length`) or for new links (LE Write Suggested
+  Default Data Length), and then asks the central itself; the host learns the effective lengths from LE Data Length
+  Change. The host's ACL packets hold up to 251 octets and are sent in fragments as long as the central receives,
+  within its time on the air. The CCM runs in extended length mode and generates its key stream when it is armed, as
+  in Zephyr, instead of at radio READY.
 - **LE 2M PHY** when the central supports it, which halves the airtime of every packet: the link layer asks for it once
   the link is encrypted and answers the central's own request. Both directions use the same PHY, as the radio switches
   PHYs only while it is disabled.

@@ -28,8 +28,15 @@ use embassy_time::{Duration, Instant};
 
 /// Handle of the only connection.
 pub const CONNECTION_HANDLE: u16 = 0;
-/// Largest ACL payload per link layer PDU.
-pub const ACL_MAX: usize = 27;
+/// Largest ACL payload the host and the link layer exchange at once: one
+/// HCI ACL packet, and the longest link layer data PDU payload with the data
+/// length extension.
+pub const ACL_MAX: usize = 251;
+/// Shortest data PDU payload and its time on the air, the defaults of the
+/// data length extension (Core, Vol 6, Part B, 4.5.10).
+pub const LENGTH_DEFAULT: [u16; 2] = [27, 328];
+/// Longest supported data PDU payload and its time on LE 1M with a MIC.
+pub const LENGTH_MAX: [u16; 2] = [251, 2120];
 /// ACL buffers towards the air.
 const ACL_OUT_BUFFERS: usize = 4;
 /// Largest host event: Command Complete with the 64-byte supported-command
@@ -82,6 +89,8 @@ const LE_CONNECTION_COMPLETE: u8 = 0x01;
 const LE_CONNECTION_UPDATE_COMPLETE: u8 = 0x03;
 /// LE subevent: long term key request.
 const LE_LTK_REQUEST: u8 = 0x05;
+/// LE subevent: data length change.
+const LE_DATA_LENGTH_CHANGE: u8 = 0x07;
 /// LE subevent: remote connection parameter request.
 const LE_REMOTE_PARAMETER_REQUEST: u8 = 0x06;
 
@@ -155,6 +164,33 @@ impl From<ReadHciError<Infallible>> for TransportError {
     fn from(_: ReadHciError<Infallible>) -> Self { Self }
 }
 
+/// An ACL fragment from the air for the host.
+#[derive(Clone, Copy)]
+struct AclIn {
+    /// Payload.
+    data: [u8; ACL_MAX],
+    /// Payload length.
+    len:  u8,
+    /// Start or continuation of an L2CAP message.
+    llid: Llid,
+}
+
+impl AclIn {
+    /// The HCI ACL data packet without its indicator, and its length.
+    fn to_hci(self) -> ([u8; ACL_MAX + 4], usize) {
+        let boundary: u8 = if self.llid == Llid::Continuation { 0x10 } else { 0x20 };
+        let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
+        let mut bytes = [0_u8; ACL_MAX + 4];
+        let len = usize::from(self.len).min(ACL_MAX);
+        for (target, source) in bytes.iter_mut().zip(
+            [handle_low, handle_high | boundary, self.len, 0].into_iter().chain(self.data.iter().take(len).copied()),
+        ) {
+            *target = source;
+        }
+        (bytes, len.saturating_add(4))
+    }
+}
+
 /// An ACL fragment from the host for the air.
 #[derive(Clone, Copy)]
 #[non_exhaustive]
@@ -181,16 +217,6 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// An ACL data packet of the connection from a received PDU payload.
-    #[inline]
-    #[must_use = "the packet is only built"]
-    pub fn acl(llid: Llid, payload: &[u8]) -> Self {
-        let boundary: u8 = if llid == Llid::Continuation { 0x10 } else { 0x20 };
-        let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
-        let [len_low, len_high] = u16::try_from(payload.len()).unwrap_or_default().to_le_bytes();
-        Self::build(PacketKind::AclData, &[handle_low, handle_high | boundary, len_low, len_high], payload)
-    }
-
     /// An LE connection complete event for directed advertising that ended
     /// without a connection.
     #[inline]
@@ -339,6 +365,19 @@ impl Packet {
             ],
             &[],
         )
+    }
+
+    /// An LE data length change event: the effective transmit octets and
+    /// time and receive octets and time.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn data_length_change(values: [u16; 4]) -> Self {
+        let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
+        let mut bytes = [EVENT_LE_META, 11, LE_DATA_LENGTH_CHANGE, handle_low, handle_high, 0, 0, 0, 0, 0, 0, 0, 0];
+        for (target, source) in bytes.iter_mut().skip(5).zip(values.iter().flat_map(|value| value.to_le_bytes())) {
+            *target = source;
+        }
+        Self::build(PacketKind::Event, &bytes, &[])
     }
 
     /// A disconnection complete event.
@@ -549,6 +588,8 @@ struct HostState {
     queries:           u8,
     /// First byte of the central's features, zero until known.
     remote_features:   u8,
+    /// Data length new links start with: payload octets and time.
+    suggested_length:  [u16; 2],
 }
 
 impl HostState {
@@ -616,6 +657,7 @@ impl HostState {
             private_address: None,
             private_timeout: PRIVATE_ADDRESS_TIMEOUT,
             remote_features: 0,
+            suggested_length: LENGTH_DEFAULT,
         }
     }
 }
@@ -623,11 +665,13 @@ impl HostState {
 /// State shared between the host interface and the link layer.
 pub struct Shared {
     /// ACL data received from the air.
-    acl_in:          Channel<CriticalSectionRawMutex, Packet, 2>,
+    acl_in:          Channel<CriticalSectionRawMutex, AclIn, 2>,
     /// ACL data from the host for the air.
     acl_out:         Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
     /// Advertising settings changed.
     changed:         Signal<CriticalSectionRawMutex, ()>,
+    /// Data length the host set for the link: payload octets and time.
+    data_length:     Signal<CriticalSectionRawMutex, [u16; 2]>,
     /// Disconnection requested by the host, with the reason.
     disconnect:      Signal<CriticalSectionRawMutex, u8>,
     /// Events for the host.
@@ -735,6 +779,7 @@ impl Shared {
             acl_in:          Channel::new(),
             acl_out:         Channel::new(),
             changed:         Signal::new(),
+            data_length:     Signal::new(),
             disconnect:      Signal::new(),
             events:          Channel::new(),
             ltk:             Signal::new(),
@@ -807,7 +852,14 @@ impl Shared {
     /// Passes received ACL data to the host. Returns false if there is no
     /// room.
     #[inline]
-    pub fn push_acl_in(&self, packet: Packet) -> bool { self.acl_in.try_send(packet).is_ok() }
+    pub fn push_acl_in(&self, llid: Llid, payload: &[u8]) -> bool {
+        let mut data = [0_u8; ACL_MAX];
+        let len = payload.len().min(ACL_MAX);
+        if let (Some(target), Some(source)) = (data.get_mut(..len), payload.get(..len)) {
+            target.copy_from_slice(source);
+        }
+        self.acl_in.try_send(AclIn { data, len: u8::try_from(len).unwrap_or(u8::MAX), llid }).is_ok()
+    }
 
     /// Queues an event for the host, waiting for room. An event the host
     /// masked is dropped.
@@ -816,6 +868,16 @@ impl Shared {
         if let Some(event) = self.state.lock(|cell| cell.borrow().deliver(packet)) {
             self.events.send(event).await;
         }
+    }
+
+    /// Queues ACL data from the host for the air, as the transport does.
+    #[cfg(test)]
+    pub(crate) fn queue_acl_for_test(&self, payload: &[u8]) -> bool {
+        let mut data = [0; ACL_MAX];
+        data.get_mut(..payload.len()).map(|target| target.copy_from_slice(payload));
+        let epoch = self.state.lock(|cell| cell.borrow().epoch);
+        let len = u8::try_from(payload.len()).unwrap_or(u8::MAX);
+        self.acl_out.try_send(AclOut { data, epoch, len, llid: Llid::Start }).is_ok()
     }
 
     /// Moves running advertising to a new resolvable private address once
@@ -905,6 +967,7 @@ impl Shared {
             self.ltk.reset();
             self.param_request.reset();
             self.parameter_reply.reset();
+            self.data_length.reset();
             self.wakeup.reset();
         }
     }
@@ -936,11 +999,17 @@ impl Shared {
         });
     }
 
+    /// Data length new links start with: payload octets and time.
+    pub(crate) fn suggested_length(&self) -> [u16; 2] { self.state.lock(|cell| cell.borrow().suggested_length) }
+
     /// Takes the next ACL packet for the host, as its bytes.
     #[cfg(test)]
-    pub(crate) fn take_acl_in(&self) -> Option<[u8; PACKET_MAX]> {
-        self.acl_in.try_receive().ok().map(|packet| packet.bytes)
+    pub(crate) fn take_acl_in(&self) -> Option<[u8; ACL_MAX + 4]> {
+        self.acl_in.try_receive().ok().map(|packet| packet.to_hci().0)
     }
+
+    /// Takes a data length the host set for the link.
+    pub(crate) fn take_data_length(&self) -> Option<[u16; 2]> { self.data_length.try_take() }
 
     /// Takes a pending disconnection request.
     #[inline]
@@ -1062,9 +1131,9 @@ impl<'shared> Hci<'shared> {
                 (27, 0xA7),
                 (28, 0x0E),
                 (32, 0x30),
-                (33, 0x30),
-                (34, 0x38),
-                (35, 0x76),
+                (33, 0xF0),
+                (34, 0x39),
+                (35, 0x7E),
                 (39, 0x04),
             ] {
                 if let Some(byte) = supported.get_mut(octet) {
@@ -1185,6 +1254,7 @@ impl<'shared> Hci<'shared> {
             0x0C33 => (if params.len() == 7 { STATUS_SUCCESS } else { STATUS_INVALID_PARAMETERS }, 0),
             0x202D | 0x204E => (self.privacy_command(opcode, params), 0),
             0x2020 | 0x2021 => self.parameter_reply_command(opcode, params, returned),
+            0x2022 | 0x2023 | 0x2024 | 0x202F => self.length_command(opcode, params, returned),
             0x0C01 | 0x0C63 | 0x2001 => (self.event_mask_command(opcode, params), 0),
             0x202E => (self.private_timeout_command(params), 0),
             0x0C7B | 0x0C7C => self.payload_timeout_command(opcode, params, returned),
@@ -1342,6 +1412,63 @@ impl<'shared> Hci<'shared> {
                 (STATUS_SUCCESS, 8)
             },
             _ => (STATUS_INVALID_PARAMETERS, 0),
+        }
+    }
+
+    /// Data length commands: LE Set Data Length (0x2022) for the link, LE
+    /// Read (0x2023) and Write (0x2024) Suggested Default Data Length for new
+    /// links, and LE Read Maximum Data Length (0x202F). Returns the status
+    /// and the length of the returned parameters.
+    fn length_command(&self, opcode: u16, params: &[u8], returned: &mut [u8; 8]) -> (u8, usize) {
+        let [max_octets, max_time] = LENGTH_MAX;
+        let values = |values: [u16; 2]| {
+            let [octets, time] = values;
+            (LENGTH_DEFAULT[0]..=max_octets).contains(&octets) && (LENGTH_DEFAULT[1]..=0x4290).contains(&time)
+        };
+        let length = |bytes: &[u8]| {
+            let &[octets0, octets1, time0, time1] = bytes else { return None };
+            let length = [u16::from_le_bytes([octets0, octets1]), u16::from_le_bytes([time0, time1])];
+            // The longest time this side can use on LE 1M and 2M.
+            values(length).then_some([length[0], length[1].min(max_time)])
+        };
+        match opcode {
+            0x2022 => {
+                let Some((&[handle0, handle1], rest)) = params.split_first_chunk::<2>() else {
+                    return (STATUS_INVALID_PARAMETERS, 0);
+                };
+                let Some(value) = length(rest) else { return (STATUS_INVALID_PARAMETERS, 0) };
+                returned[0] = handle0;
+                returned[1] = handle1;
+                let connected = self.shared.state.lock(|cell| cell.borrow().connected);
+                if !connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+                    return (STATUS_UNKNOWN_CONNECTION, 2);
+                }
+                self.shared.data_length.signal(value);
+                self.shared.wakeup.signal(());
+                (STATUS_SUCCESS, 2)
+            },
+            0x2024 => {
+                let Some(value) = length(params) else { return (STATUS_INVALID_PARAMETERS, 0) };
+                self.shared.state.lock(|cell| cell.borrow_mut().suggested_length = value);
+                (STATUS_SUCCESS, 0)
+            },
+            _ if !params.is_empty() => (STATUS_INVALID_PARAMETERS, 0),
+            0x2023 => {
+                let [octets, time] = self.shared.suggested_length();
+                for (target, source) in
+                    returned.iter_mut().zip(octets.to_le_bytes().into_iter().chain(time.to_le_bytes()))
+                {
+                    *target = source;
+                }
+                (STATUS_SUCCESS, 4)
+            },
+            _ => {
+                let maximum = [max_octets, max_time, max_octets, max_time];
+                for (target, source) in returned.iter_mut().zip(maximum.iter().flat_map(|value| value.to_le_bytes())) {
+                    *target = source;
+                }
+                (STATUS_SUCCESS, 8)
+            },
         }
     }
 
@@ -1595,6 +1722,10 @@ impl<'shared> Hci<'shared> {
         self.shared.wakeup.signal(());
         Ok(())
     }
+
+    /// Runs LE Set Data Length. Returns the status.
+    #[cfg(test)]
+    pub(crate) fn set_data_length(&self, params: &[u8]) -> u8 { self.length_command(0x2022, params, &mut [0; 8]).0 }
 }
 
 impl embedded_io::ErrorType for Hci<'_> {
@@ -1607,11 +1738,17 @@ impl Transport for Hci<'_> {
     where
         P: PacketToHost<'buffer>,
     {
-        let packet = match select(self.shared.events.receive(), self.shared.acl_in.receive()).await {
-            Either::First(packet) | Either::Second(packet) => packet,
-        };
-        let mut bytes = packet.bytes.get(..packet.len).unwrap_or_default();
-        P::read_hci(packet.kind, &mut bytes, rx).map_err(TransportError::from)
+        match select(self.shared.events.receive(), self.shared.acl_in.receive()).await {
+            Either::First(packet) => {
+                let mut bytes = packet.bytes.get(..packet.len).unwrap_or_default();
+                P::read_hci(packet.kind, &mut bytes, rx).map_err(TransportError::from)
+            },
+            Either::Second(acl) => {
+                let (buffer, len) = acl.to_hci();
+                let mut bytes = buffer.get(..len).unwrap_or_default();
+                P::read_hci(PacketKind::AclData, &mut bytes, rx).map_err(TransportError::from)
+            },
+        }
     }
 
     #[inline]
@@ -2020,7 +2157,7 @@ mod tests {
     fn disconnect_drops_data_and_pending_secrets_from_the_previous_link() {
         let shared = Shared::new();
         shared.set_connected(true);
-        assert!(shared.push_acl_in(Packet::acl(Llid::Start, &[1, 2, 3])));
+        assert!(shared.push_acl_in(Llid::Start, &[1, 2, 3]));
         assert!(shared.acl_out.try_send(AclOut { data: [0; ACL_MAX], epoch: 1, len: 1, llid: Llid::Start }).is_ok());
         shared.ltk.signal(Some([0xAA; 16]));
         shared.disconnect.signal(0x13);
