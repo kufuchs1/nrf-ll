@@ -87,8 +87,12 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             let next = started.wrapping_add(interval(&settings).await);
             // The sleep returns `SETUP_US` early, for a radio start the timer
             // triggers; advertising starts when it returns, so it sleeps that
-            // much longer to keep the advertising interval.
-            if !clock.sleep_until(next.wrapping_add(SETUP_US), shared.changed()).await {
+            // much longer to keep the advertising interval. High duty cycle
+            // directed advertising keeps the early start instead: its events
+            // must be at most 3.75 ms apart, which the loop's own time would
+            // otherwise exceed.
+            let wake = if settings.kind == Kind::DirectedHighDuty { next } else { next.wrapping_add(SETUP_US) };
+            if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }
             continue;

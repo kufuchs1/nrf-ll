@@ -1389,18 +1389,26 @@ impl<'shared> Hci<'shared> {
             if !valid {
                 return STATUS_INVALID_PARAMETERS;
             }
-            // One update at a time, as in Zephyr: a second request would
-            // replace the first, whose complete event the host then never
-            // gets.
-            if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
-                return STATUS_DISALLOWED;
-            }
             // A central that asked for parameters itself, as it does while
             // the host answers (TrouBLE's `ConnectionParamsRequest::accept`
             // sends this command first), knows the procedure. The request
             // waits until the central's update is in place; parameters it
             // already meets complete it at once, others are asked for.
             let central_asked = state.active_queries & QUERY_REMOTE_PARAMETERS != 0;
+            if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
+                if !central_asked {
+                    // One update at a time, as in Zephyr: a second request
+                    // would replace the first, whose complete event the host
+                    // then never gets.
+                    return STATUS_DISALLOWED;
+                }
+                // Part of the answer to the central: refused, the host would
+                // reject the central's request. A request not yet taken is
+                // replaced by these newer parameters; one under way is
+                // followed by them, and each completes with its own event.
+                self.shared.param_request.signal([min, max, latency, timeout]);
+                return STATUS_SUCCESS;
+            }
             if state.remote_features & 0x02 == 0 && !central_asked {
                 return STATUS_UNSUPPORTED_REMOTE_FEATURE;
             }
@@ -2292,7 +2300,13 @@ mod tests {
         shared.ask_parameters();
         assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
         assert_eq!(shared.take_param_request(), Some([6, 12, 0, 100]));
-        assert_eq!(hci.command_async(0x2013, &update), STATUS_DISALLOWED);
+        // Another accept while that update is still pending succeeds too
+        // and follows it with its own parameters.
+        let other = [0, 0, 24, 0, 40, 0, 0, 0, 100, 0, 0, 0, 0, 0];
+        assert_eq!(hci.command_async(0x2013, &other), STATUS_SUCCESS);
+        assert_eq!(shared.take_param_request(), Some([24, 40, 0, 100]));
+        // Without a central's request a second update is refused.
         assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0]), STATUS_SUCCESS);
+        assert_eq!(hci.command_async(0x2013, &other), STATUS_DISALLOWED);
     }
 }
