@@ -987,7 +987,7 @@ fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
 }
 
 #[test]
-fn packets_of_one_event_wait_and_are_processed_in_order_after_it() {
+fn data_of_one_event_goes_to_the_host_at_once_and_control_waits_for_the_event_end() {
     let shared = Shared::new();
     let mut link = connection();
     let mut rx = [0; BUFFER_LEN];
@@ -999,10 +999,13 @@ fn packets_of_one_event_wait_and_are_processed_in_order_after_it() {
         rx[DATA_HEADER_LEN..DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
         assert_eq!(link.receive(header, rx[1], true, 999, &shared), Some(true));
         assert!(link.received);
-        link.stash(&rx, false);
+        link.stash(&rx, false, &shared);
     }
-    // The host has room for two packets, both taken by the waiting ones:
-    // the next data packet is not acknowledged and comes again.
+    // Data reached the host in order; the control PDU waits.
+    assert_eq!(shared.acl_room(), 0);
+    assert!(link.pending[0].is_some());
+    // The host has room for two packets, both taken: the next data packet is
+    // not acknowledged and comes again.
     let nesn = link.nesn;
     assert_eq!(link.receive(Llid::Start.bits() | SN, 1, true, 999, &shared), Some(true));
     assert!(!link.received);
@@ -1013,8 +1016,7 @@ fn packets_of_one_event_wait_and_are_processed_in_order_after_it() {
     assert!(link.received);
     rx[0] = Llid::Continuation.bits();
     rx[1] = 0;
-    link.stash(&rx, false);
-    assert_eq!(shared.acl_room(), 2);
+    link.stash(&rx, false, &shared);
     link.process(&rx, false, &shared);
     assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA1));
     assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0xA2));
@@ -1033,9 +1035,9 @@ fn a_stashed_encrypted_packet_uses_its_counter_before_the_next_is_decrypted() {
     rx[1] = 5;
     link.rx_plain[..4].copy_from_slice(&[Llid::Start.bits(), 1, 0, 0x42]);
     assert_eq!(link.receive(rx[0], 5, true, 999, &shared), Some(true));
-    link.stash(&rx, true);
+    link.stash(&rx, true, &shared);
     assert_eq!(link.encryption.rx_counter, 1);
-    assert_eq!(link.pending[0].map(|packet| packet.bytes[3]), Some(0x42));
+    assert_eq!(shared.take_acl_in().map(|bytes| bytes[4]), Some(0x42));
 }
 
 #[test]
@@ -1048,12 +1050,17 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     link.tx_phy = Phy::M2;
     assert_eq!(link.exchange_us(), 3 * (24 + 33 * 4) + 450);
     // 251 octets with a MIC each way.
-    link.length = DataLength::new(LENGTH_MAX);
-    link.length.announced_tx = LENGTH_MAX;
-    link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
-    link.encryption.tx_on = true;
-    link.encryption.rx_on = true;
-    assert_eq!(link.exchange_us(), 3 * (24 + 261 * 4) + 450);
+    if cfg!(feature = "data-length") {
+        let mut long = connection();
+        long.phy = Phy::M2;
+        long.tx_phy = Phy::M2;
+        long.length = DataLength::new(LENGTH_MAX);
+        long.length.announced_tx = LENGTH_MAX;
+        long.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+        long.encryption.tx_on = true;
+        long.encryption.rx_on = true;
+        assert_eq!(long.exchange_us(), 3 * (24 + 261 * 4) + 450);
+    }
     link.phy = Phy::M1;
     // Interval, widening, address, ramp-up, margin and processing time.
     assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 40 - 30 - 500);
@@ -1096,6 +1103,7 @@ fn a_host_that_does_not_answer_has_the_request_rejected() {
 }
 
 #[test]
+#[cfg(feature = "data-length")]
 fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     let shared = Shared::with_all_events();
     let mut link = connection();
@@ -1139,6 +1147,7 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
 }
 
 #[test]
+#[cfg(feature = "data-length")]
 fn host_data_is_sent_in_fragments_the_central_receives() {
     let shared = Shared::new();
     shared.set_connected(true);
@@ -1167,6 +1176,7 @@ fn host_data_is_sent_in_fragments_the_central_receives() {
 }
 
 #[test]
+#[cfg(feature = "data-length")]
 fn the_link_asks_for_a_longer_data_length_only_when_the_host_allows_it() {
     let shared = Shared::new();
     let mut link = encrypted();
@@ -1188,6 +1198,7 @@ fn the_link_asks_for_a_longer_data_length_only_when_the_host_allows_it() {
 }
 
 #[test]
+#[cfg(feature = "data-length")]
 fn a_length_response_takes_effect_once_acknowledged_and_an_unknown_one_ends_the_attempts() {
     let shared = Shared::new();
     let mut link = connection();
@@ -1331,4 +1342,16 @@ fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
     assert_eq!(updates, 3);
     assert_eq!(link.updates_owed.0, 0);
     assert!(link.notifications.iter().all(Option::is_none));
+}
+
+#[test]
+#[cfg(not(feature = "data-length"))]
+fn without_the_data_length_feature_the_link_stays_at_27_octets() {
+    assert_eq!(FEATURES[0] & FEATURE_DATA_LENGTH, 0);
+    let mut link = connection();
+    link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
+    let response = link.queue[0].unwrap();
+    assert_eq!(response.data[..9], [OP_LENGTH_RSP, 27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01]);
+    assert_eq!(link.length.effective(), [27, 328, 27, 328]);
+    assert_eq!(link.tx_payload_max(), 27);
 }

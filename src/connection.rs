@@ -63,7 +63,8 @@ const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 /// reject indication, the peripheral-initiated feature exchange and LE ping
 /// (bits 0 to 4), the LE 2M PHY (bit 8), channel selection algorithm 2 (bit
 /// 14) and LE power control (bits 33 and 34).
-pub const FEATURES: [u8; 8] = [0x1F | FEATURE_DATA_LENGTH, 0x41, 0, 0, 0x06, 0, 0, 0];
+pub const FEATURES: [u8; 8] =
+    [0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 }, 0x41, 0, 0, 0x06, 0, 0, 0];
 /// Feature bit in the first octet: LE data packet length extension.
 const FEATURE_DATA_LENGTH: u8 = 0x20;
 /// Longest time on the air of a data PDU the specification allows.
@@ -155,7 +156,7 @@ const WIDENING_FIXED_US: u32 = 16;
 const T_IFS_US: u32 = 150;
 /// Time left before the next event for processing the packets of this one.
 const EVENT_GUARD_US: u32 = 500;
-/// Received packets with a payload held for processing after the event.
+/// Received control PDUs held for processing after the event.
 const RX_SLOTS: usize = 3;
 
 /// Why a connection ended.
@@ -407,7 +408,7 @@ struct RemoteRequest {
 #[derive(Clone, Copy)]
 struct Pending {
     /// Header and payload.
-    bytes:     [u8; DATA_BUFFER_LEN],
+    bytes:     [u8; DATA_HEADER_LEN + CONTROL_PAYLOAD_MAX],
     /// Whether it came encrypted.
     encrypted: bool,
 }
@@ -1396,13 +1397,13 @@ impl Connection {
         }
     }
 
-    /// Passes the packets received in the event on, in order, and reports
+    /// Handles the control PDUs received in the event, in order, and reports
     /// acknowledged ACL data.
     #[inline(never)]
     fn process(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
         self.flush_notifications(shared);
         if self.received {
-            self.stash(rx, encrypted);
+            self.stash(rx, encrypted, shared);
         }
         while let Some(mut packet) = self.pending.first_mut().and_then(Option::take) {
             self.pending.rotate_left(1);
@@ -1411,10 +1412,6 @@ impl Connection {
             match packet.bytes.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(len)) {
                 Some(payload) if header & LLID_MASK == Llid::Control.bits() => {
                     self.handle_control(payload, packet.encrypted);
-                },
-                Some(payload) if len != 0 => {
-                    let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
-                    _ = shared.push_acl_in(kind, payload);
                 },
                 Some(_) | None => {},
             }
@@ -1471,11 +1468,15 @@ impl Connection {
         self.last_valid = address;
         self.establishment_deadline = None;
         self.acknowledge(header, shared)?;
-        // A payload waits for processing after the event; data also needs
-        // room towards the host for itself and every packet before it.
-        let pending = self.pending.iter().flatten().count();
-        let data = header & LLID_MASK != Llid::Control.bits();
-        let room = len == 0 || (pending < RX_SLOTS && (!data || shared.acl_room() > pending));
+        // A control PDU waits for processing after the event; data goes to
+        // the host at once and needs room there.
+        let room = if len == 0 {
+            true
+        } else if header & LLID_MASK == Llid::Control.bits() {
+            self.pending.iter().any(Option::is_none)
+        } else {
+            shared.acl_room() != 0
+        };
         if !duplicate && room {
             self.nesn = !self.nesn;
             self.received = true;
@@ -1545,7 +1546,7 @@ impl Connection {
                 // A control PDU can change what the next packets mean: it
                 // is handled before the central sends more.
                 open &= header & LLID_MASK != Llid::Control.bits();
-                self.stash(rx, self.encryption.rx_on);
+                self.stash(rx, self.encryption.rx_on, shared);
             } else if fresh {
                 // No room for it: the central sends it again next event.
                 open = false;
@@ -1792,11 +1793,11 @@ impl Connection {
         self.encryption.phase = Phase::AwaitingEntropy { rand, ediv };
     }
 
-    /// Counts the new packet just accepted, and keeps one with a payload,
-    /// in plain text, for [`Self::process`] after the event. Its CCM
-    /// counter is used up at once, as the next packet of the event may be
-    /// decrypted before then.
-    fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool) {
+    /// Counts the new packet just accepted: passes data in plain text to the
+    /// host at once, and keeps a control PDU for [`Self::process`] after the
+    /// event. Its CCM counter is used up at once, as the next packet of the
+    /// event may be decrypted before then.
+    fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
         self.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
         // Empty PDUs have no MIC and need not produce a CCM output packet.
@@ -1809,15 +1810,25 @@ impl Connection {
         if len != 0 || header & MD != 0 {
             self.skipped = self.latency;
         }
-        // Copied straight into its slot: the link layer interrupt keeps no
-        // packet-sized copy on its stack.
-        if len != 0
-            && let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none())
-        {
-            let held = slot.insert(Pending { bytes: [0; DATA_BUFFER_LEN], encrypted });
-            if let Some(chunk) = source.first_chunk::<DATA_BUFFER_LEN>() {
-                held.bytes.copy_from_slice(chunk);
+        if len == 0 {
+            return;
+        }
+        let payload = source.get(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(usize::from(len))).unwrap_or_default();
+        if header & LLID_MASK == Llid::Control.bits() {
+            // Copied straight into its slot: the link layer interrupt keeps
+            // no packet copy on its stack.
+            if let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none()) {
+                let held = slot.insert(Pending { bytes: [0; DATA_HEADER_LEN + CONTROL_PAYLOAD_MAX], encrypted });
+                for (target, &byte) in held.bytes.iter_mut().zip(source) {
+                    *target = byte;
+                }
             }
+        } else {
+            // Data goes to the host at once, in order: a control PDU closes
+            // the event, so no data follows one that waits. `receive` made
+            // sure of the room.
+            let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
+            _ = shared.push_acl_in(kind, payload);
         }
     }
 
