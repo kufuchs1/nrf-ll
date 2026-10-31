@@ -406,6 +406,8 @@ pub struct Connection {
     phy_status:             Option<u8>,
     /// PHY change and its instant.
     phy_update:             Option<(Phy, u16)>,
+    /// Response deadline of our `LL_PING_REQ` (Core, Vol 6, Part B, 5.2).
+    ping_request:           Option<u32>,
     /// Transmit power control.
     power:                  [PowerControl; 2],
     /// PHY mask for which the peer has requested power control.
@@ -524,6 +526,9 @@ impl Connection {
             // asked for (Core, Vol 6, Part B, 5.1.1).
             if changed || update.requested {
                 self.notify(Packet::connection_update_complete(STATUS_SUCCESS, update.params), shared);
+            }
+            if update.requested {
+                shared.finish_param_request();
             }
             info!("connection interval now {} us", update.interval);
         }
@@ -647,18 +652,26 @@ impl Connection {
         shared: &Shared,
     ) -> Option<u32> {
         let asymmetric = self.phy != self.tx_phy;
-        radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit });
+        // SAFETY: `rx` is a full packet buffer borrowed for this whole
+        // exchange, which disables the radio on every path out.
+        let () =
+            unsafe { radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit }) };
         if self.encryption.rx_on {
             if !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter) {
                 self.abort = Some(ERROR_MIC_FAILURE);
                 return None;
             }
-            crypto::arm_decrypt(
-                &self.encryption.rx_config,
-                (rx.as_mut_ptr(), self.rx_plain.as_mut_ptr()),
-                &mut self.encryption.scratch,
-                self.phy,
-            );
+            // SAFETY: the configuration, scratch and both buffers live in
+            // this connection or are borrowed for the exchange, which ends
+            // the decryption with `wait_decrypted`, `stop` or `disarm`.
+            unsafe {
+                crypto::arm_decrypt(
+                    &self.encryption.rx_config,
+                    (rx.as_mut_ptr(), self.rx_plain.as_mut_ptr()),
+                    &mut self.encryption.scratch,
+                    self.phy,
+                );
+            }
         }
         if !clock.receive_at(enable) {
             clock.cancel_start();
@@ -698,6 +711,37 @@ impl Connection {
         radio.set_fast_ramp(false);
         crypto::disarm();
         Some(address)
+    }
+
+    /// Updates the encryption phases and the anchor after an exchange whose
+    /// access address arrived at `address`.
+    fn exchanged(&mut self, address: u32) {
+        if self.encryption.phase == Phase::Starting
+            && self.tx_kind == TxKind::Control
+            && self.tx.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
+        {
+            self.encryption.rx_on = true;
+            self.encryption.phase = Phase::AwaitingStartResponse;
+        }
+        // After our encrypted pause response the central answers in
+        // plain text.
+        if self.encryption.phase == Phase::Pausing
+            && self.tx_kind == TxKind::Control
+            && self.tx.get(DATA_HEADER_LEN) == Some(&OP_PAUSE_ENC_RSP)
+        {
+            self.encryption.rx_on = false;
+            self.encryption.phase = Phase::AwaitingPauseResponse;
+        }
+        if matches!(self.expect, Expect::Anchor) {
+            let expected = self.expected_anchor();
+            let drift = address.wrapping_sub(expected).cast_signed();
+            if drift.unsigned_abs() >= self.drift.0.unsigned_abs() {
+                self.drift = (drift, self.widening(expected.wrapping_sub(self.anchor)));
+            }
+        }
+        self.anchor = address;
+        self.anchor_counter = self.counter;
+        self.expect = Expect::Anchor;
     }
 
     /// Access address time expected at the current event from the last
@@ -835,8 +879,8 @@ impl Connection {
                 self.enqueue(Llid::Control, &response);
             },
             OP_PING_REQ => self.enqueue(Llid::Control, &[OP_PING_RSP]),
-            OP_VERSION_IND | OP_LENGTH_RSP | OP_PING_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {
-            },
+            OP_PING_RSP => self.ping_request = None,
+            OP_VERSION_IND | OP_LENGTH_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {},
             _ => self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, code]),
         }
         info!("control {=u8:#04x}", code);
@@ -977,6 +1021,7 @@ impl Connection {
             param_status: None,
             param_update: None,
             payload_timer: None,
+            ping_request: None,
             phy: Phy::M1,
             tx_phy: Phy::M1,
             next_tx_phy: Phy::M1,
@@ -1188,16 +1233,20 @@ impl Connection {
             *tx_header = (*tx_header & LLID_MASK) | flags;
         }
         if self.encryption.tx_sealed {
-            crypto::arm_encrypt(
-                &self.encryption.tx_config,
-                (self.tx.as_ptr(), self.tx_sealed.as_mut_ptr()),
-                &mut self.encryption.scratch,
-                self.tx_phy,
-            );
-            radio.set_buffer(self.tx_sealed.as_mut_ptr());
+            let pointers = (self.tx.as_ptr(), self.tx_sealed.as_mut_ptr());
+            let scratch = &mut self.encryption.scratch;
+            // SAFETY: the configuration, scratch and buffers belong to this
+            // connection, which disarms the CCM before the exchange returns
+            // and wipes them only after the radio and the CCM stopped.
+            let () = unsafe { crypto::arm_encrypt(&self.encryption.tx_config, pointers, scratch, self.tx_phy) };
+            // SAFETY: as above; the exchange disables the radio before it
+            // returns.
+            let () = unsafe { radio.set_buffer(self.tx_sealed.as_mut_ptr()) };
         } else {
             crypto::disarm();
-            radio.set_buffer(self.tx.as_mut_ptr());
+            // SAFETY: the transmit buffer belongs to this connection, and the
+            // exchange disables the radio before it returns.
+            let () = unsafe { radio.set_buffer(self.tx.as_mut_ptr()) };
         }
         Some(())
     }
@@ -1276,6 +1325,11 @@ impl Connection {
                 self.skipped = self.latency;
             }
             clock.sleep_until(window.0, pending::<()>()).await;
+            if !clock.ensure_crystal().await && reached(clock.now(), window.0) {
+                self.stats.skipped = self.stats.skipped.wrapping_add(1);
+                self.counter = self.counter.wrapping_add(1);
+                continue;
+            }
             self.skipped = 0;
             radio.set_channel(channel);
             radio.set_phy(self.phy);
@@ -1283,32 +1337,7 @@ impl Connection {
             self.stats.events = self.stats.events.wrapping_add(1);
             let encrypted = self.encryption.rx_on;
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
-                if self.encryption.phase == Phase::Starting
-                    && self.tx_kind == TxKind::Control
-                    && self.tx.get(DATA_HEADER_LEN) == Some(&OP_START_ENC_REQ)
-                {
-                    self.encryption.rx_on = true;
-                    self.encryption.phase = Phase::AwaitingStartResponse;
-                }
-                // After our encrypted pause response the central answers in
-                // plain text.
-                if self.encryption.phase == Phase::Pausing
-                    && self.tx_kind == TxKind::Control
-                    && self.tx.get(DATA_HEADER_LEN) == Some(&OP_PAUSE_ENC_RSP)
-                {
-                    self.encryption.rx_on = false;
-                    self.encryption.phase = Phase::AwaitingPauseResponse;
-                }
-                if matches!(self.expect, Expect::Anchor) {
-                    let expected = self.expected_anchor();
-                    let drift = address.wrapping_sub(expected).cast_signed();
-                    if drift.unsigned_abs() >= self.drift.0.unsigned_abs() {
-                        self.drift = (drift, self.widening(expected.wrapping_sub(self.anchor)));
-                    }
-                }
-                self.anchor = address;
-                self.anchor_counter = self.counter;
-                self.expect = Expect::Anchor;
+                self.exchanged(address);
             } else {
                 self.note_miss(channel, window);
             }

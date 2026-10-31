@@ -397,14 +397,18 @@ fn on_channel(
     radio.set_channel(channel);
     let listen = settings.kind != Kind::NonConnectable;
     let after = if listen { Turnaround::Receive } else { Turnaround::None };
-    radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after);
+    // SAFETY: the radio only reads the advertisement, which is borrowed for
+    // this event; every path out waits until the radio is disabled.
+    let () = unsafe { radio.prepare(advertisement.as_bytes().as_ptr().cast_mut(), after) };
     radio.transmit();
     radio.wait_end();
     if !listen {
         radio.wait_disabled();
         return None;
     }
-    radio.set_buffer(rx.as_mut_ptr());
+    // SAFETY: `rx` is a full packet buffer borrowed for this event; every
+    // path out waits until the radio is disabled.
+    let () = unsafe { radio.set_buffer(rx.as_mut_ptr()) };
     radio.wait_disabled();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
@@ -420,7 +424,9 @@ fn on_channel(
         && let Some(scanner) = scan_request(rx, settings.own)
         && settings.accepts_scan(scanner)
     {
-        radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut());
+        // SAFETY: the radio only reads the scan response, borrowed for this
+        // event, and is disabled before it returns.
+        let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
         radio.wait_disabled();
         radio.set_turnaround(Turnaround::None);
         radio.wait_end();

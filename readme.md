@@ -20,7 +20,10 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
-  the host learns when the whole time passes.
+  the host learns when the whole time passes. A central that leaves the ping unanswered for 40 s ends the link with
+  an LL response timeout, as any other procedure does.
+- **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
+  previous one reported its LE Connection Update Complete event.
 - **LE 2M PHY** when the central supports it, which halves the airtime of every packet: the link layer asks for it once
   the link is encrypted and answers the central's own request. Both directions use the same PHY, as the radio switches
   PHYs only while it is disabled.
@@ -51,6 +54,11 @@ restarts TIMER0 at an exact tick before the next event. During radio events the 
 layer interrupt and wakes on the radio events, or at least every RTC tick (30.5 µs), instead of polling them. The RC
 oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
 once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
+`clock::calibrate_rc` takes the `TEMP` peripheral. Bind the `TEMP` interrupt to `clock::on_temperature_interrupt` and
+`CLOCK_POWER` to `clock::on_clock_interrupt` to wake it; without them it checks the events every millisecond instead.
+Dropping the calibration future releases the crystal. The crystal is shared through a reference count that changes
+with its start and stop task in one critical section, and a connection event that finds the crystal stopped starts it
+again before it listens.
 
 Run the link layer in an interrupt executor above every other task, so nothing can delay its answer within the 150 µs
 interframe space.

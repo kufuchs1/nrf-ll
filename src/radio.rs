@@ -196,9 +196,14 @@ impl<'peripherals> Radio<'peripherals> {
 
     /// Clears the events and arms the radio for a reception started by a
     /// task or a PPI channel, with `turnaround` after the packet.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::set_buffer`].
     #[inline]
-    pub fn prepare(&mut self, buffer: *mut u8, turnaround: Turnaround) {
-        self.set_buffer(buffer);
+    pub unsafe fn prepare(&mut self, buffer: *mut u8, turnaround: Turnaround) {
+        // SAFETY: the caller upholds the contract of `set_buffer`.
+        let () = unsafe { self.set_buffer(buffer) };
         self.set_turnaround(turnaround);
         REGS.events_address().write_value(0);
         REGS.events_end().write_value(0);
@@ -226,10 +231,17 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.prefix0().write(|w| w.set_ap0(address.to_le_bytes().last().copied().unwrap_or_default()));
     }
 
-    /// Sets the packet buffer the radio sends from or receives into. It
-    /// must stay valid until the radio is disabled.
+    /// Sets the packet buffer the radio sends from or receives into by DMA.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must point to RAM holding the whole PDU its header announces
+    /// for a transmission, and [`BUFFER_LEN`](crate::pdu::BUFFER_LEN)
+    /// writable bytes for a reception. It must stay valid, and the CPU must not
+    /// access it while the radio may, until the radio is disabled or given
+    /// another buffer.
     #[inline]
-    pub fn set_buffer(&mut self, buffer: *mut u8) {
+    pub unsafe fn set_buffer(&mut self, buffer: *mut u8) {
         compiler_fence(Ordering::SeqCst);
         REGS.packetptr().write_value(u32::try_from(buffer.addr()).unwrap_or_default());
     }

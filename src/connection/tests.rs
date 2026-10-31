@@ -600,6 +600,54 @@ fn the_peripheral_pings_before_the_authenticated_payload_timeout() {
 }
 
 #[test]
+fn an_unanswered_ping_ends_the_link_after_the_procedure_timeout() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.payload_timer = Some((0, false));
+    link.start_procedures(23_000_000, &shared);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PING_REQ));
+    // Other authenticated traffic does not answer the ping, and no second
+    // ping starts while it runs.
+    assert_eq!(link.receive(Llid::Control.bits() | NESN, 5, true, 23_100_000, &shared), Some(true));
+    link.queue = [None; QUEUE_LEN];
+    link.start_procedures(46_000_000, &shared);
+    assert!(link.queue[0].is_none());
+    assert!(link.abort.is_none());
+    link.start_procedures(63_000_000, &shared);
+    assert_eq!(link.abort, Some(ERROR_RESPONSE_TIMEOUT));
+}
+
+#[test]
+fn a_ping_response_ends_the_ping_procedure() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.ping_request = Some(1000);
+    link.handle_control(&[OP_PING_RSP], true);
+    assert!(link.ping_request.is_none());
+    link.ping_request = Some(1000);
+    link.handle_rejection(OP_UNKNOWN_RSP, &[OP_PING_REQ]);
+    assert!(link.ping_request.is_none());
+    link.start_procedures(2000, &shared);
+    assert!(link.abort.is_none());
+}
+
+#[test]
+fn an_expired_payload_timeout_waits_for_room_in_the_event_queue() {
+    let shared = Shared::with_all_events();
+    let mut link = encrypted();
+    link.payload_timer = Some((0, true));
+    while shared.try_push_event(Packet::completed_packets(1)) {}
+    link.start_procedures(31_000_000, &shared);
+    assert!(link.notifications.iter().flatten().any(Packet::is_payload_timeout));
+    // It is not queued twice while it waits.
+    link.payload_timer = Some((0, true));
+    link.start_procedures(62_000_000, &shared);
+    assert_eq!(link.notifications.iter().flatten().filter(|event| event.is_payload_timeout()).count(), 1);
+}
+
+#[test]
 fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
     let phases = [
         Phase::AwaitingEntropy { rand: [0; 8], ediv: [0; 2] },

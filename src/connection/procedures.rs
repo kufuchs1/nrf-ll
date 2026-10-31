@@ -88,17 +88,22 @@ impl Connection {
         let timeout = shared.payload_timeout();
         let elapsed = now.wrapping_sub(last);
         if elapsed >= timeout {
-            // Dropped unless the host enabled it in event mask page 2.
-            _ = shared.try_push_event(Packet::payload_timeout_expired());
+            // Retained until the host takes it; dropped by the delivery only
+            // if the host did not enable it in event mask page 2.
+            if !self.notifications.iter().flatten().any(Packet::is_payload_timeout) {
+                self.notify(Packet::payload_timeout_expired(), shared);
+            }
             self.payload_timer = Some((now, false));
             info!("authenticated payload timeout expired");
         } else if !pinged
+            && self.ping_request.is_none()
             && elapsed >= timeout.saturating_sub(timeout >> 2_u32)
             && self.encryption.phase == Phase::Idle
             && self.queue.iter().all(Option::is_none)
         {
             self.enqueue(Llid::Control, &[OP_PING_REQ]);
             self.payload_timer = Some((last, true));
+            self.ping_request = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
         } else {
             // Authenticated traffic is recent enough.
         }
@@ -310,6 +315,7 @@ impl Connection {
                     self.feature_error = Some(error);
                 }
             },
+            OP_PING_REQ => self.ping_request = None,
             OP_CONNECTION_PARAM_REQ if self.param_request.is_some() => {
                 self.param_request = None;
                 self.param_status = Some(error);
@@ -325,6 +331,7 @@ impl Connection {
             && shared.try_push_event(Packet::connection_update_complete(status, self.current_params()))
         {
             self.param_status = None;
+            shared.finish_param_request();
         }
     }
 
@@ -338,7 +345,7 @@ impl Connection {
         shared.set_remote_features(self.central_features.map_or(0, |[first, ..]| first));
         self.announce_power();
         self.check_payload(now, shared);
-        if let Some(deadline) = self.param_request
+        if let Some(deadline) = self.param_request.or(self.ping_request)
             && reached(now, deadline)
         {
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
