@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     clock::reached,
-    hci::{ConnectionParams, LENGTH_DEFAULT, Packet, Shared},
+    hci::{ConnectionParams, Packet, Shared},
     log::info,
     pdu::{Llid, field, valid_connection_parameters},
     power_control::LEVELS_DBM,
@@ -123,15 +123,12 @@ impl Connection {
         )
     }
 
-    /// Applies a data length the host set for the link, which starts the
-    /// procedure again, and tells the host of changed effective lengths
-    /// (LE Data Length Change).
+    /// Takes a data length the host set for the link, and tells the host of
+    /// changed effective lengths (LE Data Length Change).
     pub(super) fn drive_length(&mut self, shared: &Shared) {
         if let Some(length) = shared.take_data_length() {
+            // `start_procedures` tells the central once nothing else runs.
             self.length.local_tx = length;
-            if !matches!(self.length_request, Request::Requested(_)) {
-                self.length_request = Request::NotStarted;
-            }
         }
         let effective = self.length.effective();
         if effective != self.length.reported {
@@ -147,6 +144,10 @@ impl Connection {
     /// in [`HOST_REPLY_US`] has the request rejected. Without a host that
     /// decides, the link layer accepts any valid request.
     pub(super) fn drive_remote_request(&mut self, now: u32, shared: &Shared) {
+        if let Some(status) = self.merged_outcome.take() {
+            let params = self.current_params();
+            self.complete_updates(shared.take_merged_updates(), status, params, shared);
+        }
         let Some(request) = self.remote_request else { return };
         if request.asked.is_none() && !shared.host_decides_parameters() {
             // Any parameters the central proposes suit the device.
@@ -158,6 +159,7 @@ impl Connection {
                 *target = *source;
             }
             self.enqueue(Llid::Control, &response);
+            self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             return;
         }
         let Some(deadline) = request.asked else {
@@ -189,9 +191,19 @@ impl Connection {
                 {
                     *target = source;
                 }
+                // No preferred periodicity of ours: the central's could exceed
+                // the host's interval range, which a central rejects.
+                if let Some(periodicity) = response.get_mut(9) {
+                    *periodicity = 0;
+                }
                 self.enqueue(Llid::Control, &response);
+                self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             },
-            Err(reason) => self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]),
+            Err(reason) => {
+                self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]);
+                // Commands that were part of an answer the host withdrew.
+                self.merged_outcome = Some(reason);
+            },
         }
     }
 
@@ -237,6 +249,7 @@ impl Connection {
                     // learns the outcome at the instant.
                     update.requested = self.param_request.take().is_some();
                     self.param_update = Some(update);
+                    self.remote_update = None;
                 }
             },
             OP_CONNECTION_PARAM_RSP => {
@@ -390,10 +403,22 @@ impl Connection {
                 }
             },
             OP_PING_REQ => self.ping_request = None,
-            OP_LENGTH_REQ => self.length_request = Request::Done,
+            OP_LENGTH_REQ => {
+                self.length_request = Request::Done;
+                self.length.unsupported = true;
+                self.length.offered_tx = None;
+            },
             OP_CONNECTION_PARAM_REQ if self.param_request.is_some() => {
                 self.param_request = None;
                 self.param_status = Some(error);
+            },
+            // The central ended its own request after our response, naming
+            // the response as the specification says, or its request.
+            OP_CONNECTION_PARAM_REQ | OP_CONNECTION_PARAM_RSP => {
+                if self.remote_update.is_some() {
+                    self.merged_outcome = Some(error);
+                }
+                self.remote_update = None;
             },
             _ => {},
         }
@@ -420,8 +445,10 @@ impl Connection {
         shared.set_remote_features(self.central_features.map_or(0, |[first, ..]| first));
         self.announce_power();
         self.check_payload(now, shared);
-        if let Some(deadline) = self.param_request.or(self.ping_request)
-            && reached(now, deadline)
+        if [self.param_request, self.ping_request, self.remote_update]
+            .into_iter()
+            .flatten()
+            .any(|deadline| reached(now, deadline))
         {
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
             return;
@@ -439,7 +466,8 @@ impl Connection {
             && self.channel_update.is_none()
             && self.queue.iter().all(Option::is_none)
             && self.notifications.iter().all(Option::is_none)
-            && self.remote_request.is_none();
+            && self.remote_request.is_none()
+            && self.remote_update.is_none();
         let ours_running = [self.features_request, self.phy_request, self.length_request]
             .iter()
             .any(|request| matches!(request, Request::Requested(_)))
@@ -465,13 +493,15 @@ impl Connection {
             let [tx, rx] = self.preferred_phys;
             self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
             self.phy_request = Request::Requested(deadline);
-        } else if self.length_request == Request::NotStarted
-            && self.length.local_tx != LENGTH_DEFAULT
-            && self.central_features.is_some_and(|[first, ..]| first & FEATURE_DATA_LENGTH != 0)
+        } else if self.length.local_tx != self.length.announced_tx
+            && !self.length.unsupported
+            && self.central_features.is_none_or(|[first, ..]| first & FEATURE_DATA_LENGTH != 0)
         {
-            // The host lets this side send longer packets than the default:
-            // the central learns it, and of the longest this side receives.
-            self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_REQ));
+            // The host changed what this side may send: the central learns
+            // it, and of the longest this side receives. Unknown features
+            // count as supported, as in Zephyr; an unknown response ends it.
+            let request = self.length.pdu(OP_LENGTH_REQ);
+            self.enqueue(Llid::Control, &request);
             self.length_request = Request::Requested(deadline);
         } else if let Some([min, max, latency, timeout]) = shared.take_param_request() {
             let current = self.current_params();

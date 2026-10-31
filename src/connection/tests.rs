@@ -1049,6 +1049,7 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     assert_eq!(link.exchange_us(), 3 * (24 + 33 * 4) + 450);
     // 251 octets with a MIC each way.
     link.length = DataLength::new(LENGTH_MAX);
+    link.length.announced_tx = LENGTH_MAX;
     link.length.take_peer(&[251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
     link.encryption.tx_on = true;
     link.encryption.rx_on = true;
@@ -1108,13 +1109,24 @@ fn the_data_length_follows_both_sides_and_the_time_on_the_air() {
     link.drive_length(&shared);
     assert_eq!(link.length.reported, [27, 328, 251, 2120]);
     assert!(link.notifications.iter().all(Option::is_none));
-    // The host lets the link send 251 octets: the procedure runs again.
+    // Our response is acknowledged: the central knows we send 27 octets.
+    link.length.offer_taken();
+    // The host lets the link send 251 octets. Nothing longer goes out until
+    // the central has been told, and has answered.
     shared.set_connected(true);
     assert_eq!(crate::hci::Hci::new(&shared).set_data_length(&[0, 0, 251, 0, 0x48, 0x08]), 0);
-    link.length_request = Request::Done;
     link.drive_length(&shared);
-    assert!(link.length_request == Request::NotStarted);
+    assert_eq!(link.length.local_tx, LENGTH_MAX);
+    assert_eq!(link.tx_payload_max(), 27);
+    let request = link.length.pdu(OP_LENGTH_REQ);
+    assert_eq!(request, [OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    assert_eq!(link.tx_payload_max(), 27);
+    link.handle_control(&[OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
     assert_eq!(link.tx_payload_max(), 251);
+    // A host that lowers the length takes effect at once.
+    link.length.local_tx = [100, 2120];
+    assert_eq!(link.tx_payload_max(), 100);
+    link.length.local_tx = LENGTH_MAX;
     // Encrypted on LE 1M, 2120 us still hold 251 octets with the MIC; a
     // central that receives in 1000 us gets at most 107.
     link.encryption.tx_on = true;
@@ -1173,4 +1185,150 @@ fn the_link_asks_for_a_longer_data_length_only_when_the_host_allows_it() {
     link.handle_control(&[OP_LENGTH_RSP, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], true);
     assert!(link.length_request == Request::Done);
     assert_eq!(link.length.effective(), [251, 2120, 251, 2120]);
+}
+
+#[test]
+fn a_length_response_takes_effect_once_acknowledged_and_an_unknown_one_ends_the_attempts() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.length = DataLength::new(LENGTH_MAX);
+    link.handle_control(&[OP_LENGTH_REQ, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08], false);
+    link.queue = [None; QUEUE_LEN];
+    assert_eq!(link.tx_payload_max(), 27);
+    link.tx[DATA_HEADER_LEN] = OP_LENGTH_RSP;
+    link.tx_kind = TxKind::Control;
+    assert_eq!(link.acknowledge(NESN, &shared), Some(()));
+    assert_eq!(link.tx_payload_max(), 251);
+    // A central that does not know the procedure is not asked again.
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.length.local_tx = LENGTH_MAX;
+    link.start_procedures(0, &shared);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_LENGTH_REQ));
+    link.queue = [None; QUEUE_LEN];
+    link.handle_rejection(OP_UNKNOWN_RSP, &[OP_LENGTH_REQ]);
+    link.start_procedures(0, &shared);
+    assert!(link.queue[0].is_none());
+    assert_eq!(link.tx_payload_max(), 27);
+}
+
+#[test]
+fn a_partly_sent_host_packet_keeps_the_event_open_and_latency_off() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let mut link = connection();
+    link.expect = Expect::Anchor;
+    assert!(shared.queue_acl_for_test(&[7; 60]));
+    link.load_next(&shared);
+    assert!(link.tx_kind == TxKind::AclPart);
+    assert!(!shared.has_acl_out());
+    link.tx_kind = TxKind::Empty;
+    assert!(!link.can_skip(&shared));
+}
+
+#[test]
+fn an_answered_central_parameter_request_holds_own_procedures_until_its_update() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_CONNECTION_PARAM_RSP));
+    link.queue = [None; QUEUE_LEN];
+    // The PHY request waits for the central's update.
+    link.start_procedures(1000, &shared);
+    assert!(link.queue[0].is_none());
+    // A central that never sends it ends the link like any procedure.
+    link.start_procedures(PROCEDURE_TIMEOUT_US, &shared);
+    assert_eq!(link.abort, Some(ERROR_RESPONSE_TIMEOUT));
+}
+
+#[test]
+fn a_central_rejecting_our_parameter_response_ends_its_procedure() {
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    assert!(link.remote_update.is_some());
+    link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_RSP, ERROR_INVALID_PARAMETERS], true);
+    assert!(link.remote_update.is_none());
+    link.queue = [None; QUEUE_LEN];
+    link.start_procedures(PROCEDURE_TIMEOUT_US, &shared);
+    assert_eq!(link.abort, None);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PHY_REQ));
+}
+
+#[test]
+fn a_host_update_sent_with_the_answer_completes_once_the_central_update_is_in_place() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let hci = crate::hci::Hci::new(&shared);
+    let mut link = encrypted();
+    link.features_request = Request::Done;
+    link.phy_request = Request::Done;
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x06)));
+    // TrouBLE's accept: LE Connection Update for the central's range, then
+    // the reply. The central's periodicity is not repeated.
+    assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    link.drive_remote_request(10, &shared);
+    let response = link.queue[0].unwrap();
+    assert_eq!(response.data[..10], [OP_CONNECTION_PARAM_RSP, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0]);
+    link.queue = [None; QUEUE_LEN];
+    // Nothing of ours starts while the central's update is pending.
+    link.start_procedures(20, &shared);
+    assert!(link.queue[0].is_none());
+    // The central's update: interval 20 units, latency 4, timeout 600, at
+    // event 6. At its instant the merged command completes, once.
+    link.handle_control(&[OP_CONNECTION_UPDATE_IND, 1, 0, 0, 20, 0, 4, 0, 0x58, 0x02, 6, 0], true);
+    assert!(link.remote_update.is_none());
+    link.counter = 6;
+    link.apply_instants(&shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
+    assert_eq!(shared.take_event_code(), None);
+    assert_eq!(shared.take_merged_updates(), 0);
+}
+
+#[test]
+fn a_merged_host_update_completes_with_the_central_rejection() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let hci = crate::hci::Hci::new(&shared);
+    let mut link = encrypted();
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    _ = shared.take_event_code();
+    assert_eq!(hci.command_async(0x2013, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 12, 0, 24, 0, 4, 0, 0x58, 0x02, 0, 0, 0, 0]), 0);
+    link.drive_remote_request(10, &shared);
+    link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_RSP, ERROR_INVALID_PARAMETERS], true);
+    link.drive_remote_request(20, &shared);
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
+    assert_eq!(shared.take_event_code(), None);
+}
+
+#[test]
+fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    while shared.try_push_event(Packet::completed_packets(1)) {}
+    let params = link.current_params();
+    link.complete_updates(3, STATUS_SUCCESS, params, &shared);
+    assert_eq!(link.notifications.iter().flatten().count(), 1);
+    assert_eq!(link.updates_owed.0, 2);
+    // The host reads its events: the rest follows in order.
+    let mut updates = 0;
+    for _ in 0..8 {
+        while let Some((code, subevent)) = shared.take_event_code() {
+            updates += usize::from(code == 0x3E && subevent == 0x03);
+        }
+        link.flush_notifications(&shared);
+    }
+    assert_eq!(updates, 3);
+    assert_eq!(link.updates_owed.0, 0);
+    assert!(link.notifications.iter().all(Option::is_none));
 }

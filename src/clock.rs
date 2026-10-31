@@ -92,8 +92,9 @@ const RTC_SYNC: usize = 1;
 const RTC_MASK: u32 = 0x00FF_FFFF;
 /// Smallest distance from the current RTC tick a compare event needs.
 const RTC_MIN_TICKS: u32 = 2;
-/// Time from the TIMER0 restart until the time slept for.
-const SETUP_US: u32 = 300;
+/// Time from the TIMER0 restart until the time slept for: how early
+/// [`Clock::sleep_until`] returns, for the caller to program a radio start.
+pub const SETUP_US: u32 = 300;
 /// Shortest wait for which TIMER0 and the crystal stop.
 const SLEEP_MIN_US: u32 = 3000;
 
@@ -180,6 +181,8 @@ impl Drop for ResumeGuard<'_, '_> {
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.clock.cancel_start();
         REGS.tasks_stop().write_value(1);
+        // STOP alone keeps drawing current (nRF52832 anomaly 78).
+        REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         RTC.events_compare(RTC_RESUME).write_value(0);
         self.clock.paused = Some(self.origin);
@@ -315,6 +318,8 @@ impl<'peripherals> Clock<'peripherals> {
     #[must_use = "the clock stops being usable once dropped"]
     pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self {
         REGS.tasks_stop().write_value(1);
+        // STOP alone keeps drawing current (nRF52832 anomaly 78).
+        REGS.tasks_shutdown().write_value(1);
         REGS.mode().write(|w| w.set_mode(Mode::Timer));
         REGS.bitmode().write(|w| w.set_bitmode(Bitmode::_32bit));
         REGS.prescaler().write(|w| w.set_prescaler(PRESCALER_1MHZ));
@@ -371,6 +376,8 @@ impl<'peripherals> Clock<'peripherals> {
         PPI.chenclr().write(|w| w.set_ch(PPI_SYNC, true));
         let time = self.base.wrapping_add(REGS.cc(CC_NOW).read());
         REGS.tasks_stop().write_value(1);
+        // STOP alone keeps drawing current (nRF52832 anomaly 78).
+        REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         release_crystal();
         self.paused = Some((tick, time));
@@ -411,7 +418,13 @@ impl<'peripherals> Clock<'peripherals> {
             return true;
         }
         if self.paused.is_none() && ahead < SLEEP_MIN_US {
-            return matches!(select(Timer::after_micros(u64::from(ahead)), interrupt).await, Either::First(()));
+            // The radio start is timed by the TIMER0 compare, so the caller
+            // wakes [`SETUP_US`] early to program it, as after a pause.
+            let early = ahead.saturating_sub(SETUP_US);
+            if early == 0 {
+                return true;
+            }
+            return matches!(select(Timer::after_micros(u64::from(early)), interrupt).await, Either::First(()));
         }
         self.pause();
         let Some((tick, time)) = self.paused else { return true };

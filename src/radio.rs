@@ -349,9 +349,10 @@ impl<'peripherals> Radio<'peripherals> {
     /// data channels.
     #[inline]
     pub fn set_s1_included(&mut self, included: bool) {
-        // This controller never negotiates data length extension. Bound DMA
-        // and CCM input to 27 payload bytes plus the four-byte MIC.
-        REGS.pcnf1().modify(|w| w.set_maxlen(if included { 31 } else { MAX_PAYLOAD }));
+        // Data PDUs carry up to 251 payload octets and the four-byte MIC
+        // with the data length extension, as advertising PDUs fit 255 too:
+        // the radio receives and sends whole packets of either.
+        REGS.pcnf1().modify(|w| w.set_maxlen(MAX_PAYLOAD));
         REGS.pcnf0().modify(|w| {
             w.set_lflen(LENGTH_BITS);
             w.set_s0len(true);
@@ -374,6 +375,9 @@ impl<'peripherals> Radio<'peripherals> {
             w.set_ch(PPI_SWITCH_ENABLE, true);
         });
         SWITCH.tasks_stop().write_value(1);
+        // STOP alone keeps the timer's clock requested (nRF52832 anomaly
+        // 78), as Zephyr notes for its software switch timer.
+        SWITCH.tasks_shutdown().write_value(1);
         SWITCH.tasks_clear().write_value(1);
         SWITCH.events_compare(0).write_value(0);
         let (task, offset) = match turnaround {

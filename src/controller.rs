@@ -3,7 +3,7 @@
 
 use crate::{
     advertiser::legacy::{self, Kind, Settings},
-    clock::Clock,
+    clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
     hci::{ConnectionParams, Packet, Shared},
     log::info,
@@ -85,7 +85,14 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let started = clock.now();
         let Some((request, end)) = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx) else {
             let next = started.wrapping_add(interval(&settings).await);
-            if !clock.sleep_until(next, shared.changed()).await {
+            // The sleep returns `SETUP_US` early, for a radio start the timer
+            // triggers; advertising starts when it returns, so it sleeps that
+            // much longer to keep the advertising interval. High duty cycle
+            // directed advertising keeps the early start instead: its events
+            // must be at most 3.75 ms apart, which the loop's own time would
+            // otherwise exceed.
+            let wake = if settings.kind == Kind::DirectedHighDuty { next } else { next.wrapping_add(SETUP_US) };
+            if !clock.sleep_until(wake, shared.changed()).await {
                 since = None;
             }
             continue;
@@ -124,7 +131,14 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             shared.complete_reset();
             continue;
         }
-        if !connection.flush_after_disconnect(shared).await {
+        // The host gets the retained events and every packet the link
+        // acknowledged before it learns that the link ended.
+        if !connection.flush_after_disconnect(shared).await
+            || matches!(
+                select(shared.acl_in_drained(), shared.reset_requested()).await,
+                embassy_futures::select::Either::Second(())
+            )
+        {
             radio.disable();
             clock.pause();
             shared.complete_reset();

@@ -304,15 +304,24 @@ enum Expect {
 /// in octets and its time on the air in microseconds, each way.
 #[derive(Clone, Copy)]
 struct DataLength {
+    /// What the central knows this side may send: the defaults until an
+    /// `LL_LENGTH_RSP` of ours was acknowledged or the central answered our
+    /// `LL_LENGTH_REQ`. Longer packets than announced are never sent.
+    announced_tx: [u16; 2],
     /// What the host lets this side send.
-    local_tx: [u16; 2],
+    local_tx:     [u16; 2],
+    /// What this side offered in its last `LL_LENGTH_REQ` or `LL_LENGTH_RSP`,
+    /// until the central took it.
+    offered_tx:   Option<[u16; 2]>,
     /// What the central receives, as it said.
-    peer_rx:  [u16; 2],
+    peer_rx:      [u16; 2],
     /// What the central sends, as it said.
-    peer_tx:  [u16; 2],
+    peer_tx:      [u16; 2],
     /// Effective values last reported to the host: transmit octets and
     /// time, receive octets and time.
-    reported: [u16; 4],
+    reported:     [u16; 4],
+    /// Whether the central answered our `LL_LENGTH_REQ` as unknown.
+    unsupported:  bool,
 }
 
 impl DataLength {
@@ -320,9 +329,11 @@ impl DataLength {
     fn effective(&self) -> [u16; 4] {
         let [default_octets, default_time] = LENGTH_DEFAULT;
         let [max_octets, max_time] = LENGTH_MAX;
+        // A host that lowers its length takes effect at once: shorter packets
+        // are always allowed.
         [
-            self.local_tx[0].min(self.peer_rx[0]),
-            self.local_tx[1].min(self.peer_rx[1]).max(default_time),
+            self.local_tx[0].min(self.announced_tx[0]).min(self.peer_rx[0]),
+            self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).max(default_time),
             max_octets.min(self.peer_tx[0]).max(default_octets),
             max_time.min(self.peer_tx[1]).max(default_time),
         ]
@@ -332,12 +343,30 @@ impl DataLength {
     /// side send.
     const fn new(local_tx: [u16; 2]) -> Self {
         let [octets, time] = LENGTH_DEFAULT;
-        Self { local_tx, peer_rx: LENGTH_DEFAULT, peer_tx: LENGTH_DEFAULT, reported: [octets, time, octets, time] }
+        Self {
+            announced_tx: LENGTH_DEFAULT,
+            local_tx,
+            offered_tx: None,
+            peer_rx: LENGTH_DEFAULT,
+            peer_tx: LENGTH_DEFAULT,
+            reported: [octets, time, octets, time],
+            unsupported: false,
+        }
+    }
+
+    /// Makes the values this side offered effective: the central answered
+    /// our request, or acknowledged our response.
+    const fn offer_taken(&mut self) {
+        if let Some(offered) = self.offered_tx.take() {
+            self.announced_tx = offered;
+        }
     }
 
     /// The payload of `LL_LENGTH_REQ` and `LL_LENGTH_RSP`: the longest
-    /// supported reception and what this side may send.
-    fn pdu(&self, code: u8) -> [u8; 9] {
+    /// supported reception and what this side may send, which becomes
+    /// effective once the central took it.
+    fn pdu(&mut self, code: u8) -> [u8; 9] {
+        self.offered_tx = Some(self.local_tx);
         let mut pdu = [code, 0, 0, 0, 0, 0, 0, 0, 0];
         let [max_octets, max_time] = LENGTH_MAX;
         let values = [max_octets, max_time, self.local_tx[0], self.local_tx[1]];
@@ -485,6 +514,9 @@ pub struct Connection {
     length_request:         Request,
     /// Used data channels.
     map:                    UsedChannels,
+    /// Status for the LE Connection Update commands that were part of the
+    /// host's answer, once the central's request ended without an update.
+    merged_outcome:         Option<u8>,
     /// Next expected sequence number.
     nesn:                   bool,
     /// Transmit PHY to apply with the next PHY instant.
@@ -529,6 +561,9 @@ pub struct Connection {
     received:               bool,
     /// A central's connection parameter request waiting for an answer.
     remote_request:         Option<RemoteRequest>,
+    /// Deadline of the central's connection parameter request we answered,
+    /// until its `LL_CONNECTION_UPDATE_IND` or rejection.
+    remote_update:          Option<u32>,
     /// Time of the next statistics log.
     report_at:              u32,
     /// Counters and crystal restarts at the last statistics log.
@@ -559,6 +594,9 @@ pub struct Connection {
     tx_phy:                 Phy,
     /// Encrypted copy of [`Self::tx`] as sent.
     tx_sealed:              [u8; DATA_BUFFER_LEN],
+    /// LE Connection Update Complete events still owed to the host beyond
+    /// the retained notifications, with their status and parameters.
+    updates_owed:           (u8, u8, ConnectionParams),
     /// Remote version, retained once our only version response is queued.
     version:                Option<[u8; 5]>,
     /// Version procedure state, including its response deadline.
@@ -585,6 +623,7 @@ impl Connection {
                         self.terminate = Some((reason, true));
                     }
                 },
+                TxKind::Control if self.tx.get(DATA_HEADER_LEN) == Some(&OP_LENGTH_RSP) => self.length.offer_taken(),
                 TxKind::AclPart | TxKind::Control | TxKind::Empty => {},
             }
             self.load_next(shared);
@@ -632,10 +671,11 @@ impl Connection {
             self.timeout = update.timeout;
             self.param_update = None;
             // The host learns of updates that change something or that it
-            // asked for (Core, Vol 6, Part B, 5.1.1).
-            if changed || update.requested {
-                self.notify(Packet::connection_update_complete(STATUS_SUCCESS, update.params), shared);
-            }
+            // asked for (Core, Vol 6, Part B, 5.1.1), once per LE Connection
+            // Update it sent: its own request, and those that were part of
+            // its answer to the central's request this update ends.
+            let owed = u8::from(update.requested).saturating_add(shared.take_merged_updates());
+            self.complete_updates(owed.max(u8::from(changed)), STATUS_SUCCESS, update.params, shared);
             if update.requested {
                 shared.finish_param_request();
             }
@@ -671,6 +711,7 @@ impl Connection {
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.tx_kind == TxKind::Empty
+            && self.acl.is_none()
             && self.queue.iter().all(Option::is_none)
             && self.terminate.is_none()
             && self.encryption.phase == Phase::Idle
@@ -690,6 +731,20 @@ impl Connection {
             .wrapping_sub(RAMP_UP_US)
             .wrapping_sub(RX_MARGIN_US)
             .wrapping_sub(EVENT_GUARD_US)
+    }
+
+    /// Sends `count` LE Connection Update Complete events with `status` and
+    /// `params`: the first retained until delivered, any further one if the
+    /// host has room.
+    fn complete_updates(&mut self, count: u8, status: u8, params: ConnectionParams, shared: &Shared) {
+        if count == 0 {
+            return;
+        }
+        self.notify(Packet::connection_update_complete(status, params), shared);
+        // Further events follow the retained ones as the host makes room.
+        let (owed, _, _) = self.updates_owed;
+        self.updates_owed = (owed.saturating_add(count.saturating_sub(1)), status, params);
+        self.flush_notifications(shared);
     }
 
     /// Advances the encryption start procedure with the host's answer.
@@ -968,6 +1023,20 @@ impl Connection {
                 return false;
             }
         }
+        while self.updates_owed.0 != 0 {
+            let (owed, status, params) = self.updates_owed;
+            if matches!(
+                embassy_futures::select::select(
+                    shared.push_event(Packet::connection_update_complete(status, params)),
+                    shared.reset_requested()
+                )
+                .await,
+                embassy_futures::select::Either::Second(())
+            ) {
+                return false;
+            }
+            self.updates_owed.0 = owed.saturating_sub(1);
+        }
         true
     }
 
@@ -975,12 +1044,19 @@ impl Connection {
     fn flush_notifications(&mut self, shared: &Shared) {
         while let Some(event) = self.notifications.first().copied().flatten() {
             if !shared.try_push_event(event) {
-                break;
+                return;
             }
             self.notifications.rotate_left(1);
             if let Some(last) = self.notifications.last_mut() {
                 *last = None;
             }
+        }
+        let (owed, status, params) = self.updates_owed;
+        for remaining in (0..owed).rev() {
+            if !shared.try_push_event(Packet::connection_update_complete(status, params)) {
+                break;
+            }
+            self.updates_owed.0 = remaining;
         }
     }
 
@@ -1059,8 +1135,10 @@ impl Connection {
             OP_LENGTH_REQ | OP_LENGTH_RSP => {
                 self.length.take_peer(params);
                 if code == OP_LENGTH_REQ {
-                    self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_RSP));
+                    let response = self.length.pdu(OP_LENGTH_RSP);
+                    self.enqueue(Llid::Control, &response);
                 } else {
+                    self.length.offer_taken();
                     self.length_request = Request::Done;
                 }
             },
@@ -1223,6 +1301,13 @@ impl Connection {
             queue: [None; QUEUE_LEN],
             pending: [None; RX_SLOTS],
             remote_request: None,
+            remote_update: None,
+            updates_owed: (
+                0,
+                STATUS_SUCCESS,
+                ConnectionParams::new(request.interval, request.latency, request.timeout),
+            ),
+            merged_outcome: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
@@ -1475,7 +1560,11 @@ impl Connection {
             }
             open = false;
         }
-        let ours_more = self.queue.iter().any(Option::is_some) || shared.has_acl_out();
+        // A host packet partly sent counts: its rest follows in fragments.
+        let ours_more = self.tx_kind == TxKind::AclPart
+            || self.acl.is_some()
+            || self.queue.iter().any(Option::is_some)
+            || shared.has_acl_out();
         if let Some(tx_header) = self.tx.first_mut() {
             let flags = if self.sn { SN } else { 0 }
                 | if self.nesn { NESN } else { 0 }
