@@ -51,7 +51,8 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
 The host stack can take its random numbers from the hardware generator ([`random`](src/hci.rs)) and AES-128 from the
 hardware AES ([`encrypt_block`](src/crypto.rs), the ECB). The resolvable private addresses and the identity resolving
 keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio event: each
-block runs with interrupts off and is retried after an abort, once the link layer has handled the event.
+block runs with interrupts off and is retried after an abort, once the link layer has handled the event. The CPU
+sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB` interrupt disabled in the NVIC.
 
 ## Power
 
@@ -60,8 +61,16 @@ restarts TIMER0 at an exact tick before the next event. During radio events the 
 layer interrupt and wakes only on the radio events and, for the end of a receive window, a TIMER0 compare, instead of
 polling them. Their interrupts stay disabled in the NVIC and only mark themselves pending, so keep the `RADIO` and
 `TIMER0` interrupts disabled there. Only the short waits for an RTC compare a few ticks ahead also wake on the RTC tick
-(30.5 µs). The RC
-oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
+(30.5 µs).
+
+The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 10 µs shorter after each restart
+whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs. A
+late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s connection report shows the lead.
+
+The random delay of each advertising event and the entropy of each encryption start come from the RNG interrupt while
+other tasks run: bind and enable `RNG` to `rng::on_interrupt`.
+
+The RC oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
 once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
 `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable `TEMP` to
 `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for its first

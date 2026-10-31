@@ -7,7 +7,7 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::radio::Phy;
+use crate::{radio::Phy, sleep};
 use core::{
     hint::black_box,
     sync::atomic::{Ordering, compiler_fence},
@@ -179,9 +179,19 @@ fn ecb(data: &mut [u8; 48]) -> bool {
     ECB.events_endecb().write_value(0);
     ECB.events_errorecb().write_value(0);
     ECB.ecbdataptr().write_value(u32::try_from(data.as_mut_ptr().addr()).unwrap_or_default());
+    ECB.intenset().write(|w| {
+        w.set_endecb(true);
+        w.set_errorecb(true);
+    });
     compiler_fence(Ordering::SeqCst);
     ECB.tasks_startecb().write_value(1);
-    while ECB.events_endecb().read() == 0 && ECB.events_errorecb().read() == 0 {}
+    // The CPU sleeps until the ECB reports its end or an abort, woken by the
+    // pending ECB interrupt, which stays disabled in the NVIC.
+    sleep::until(|| ECB.events_endecb().read() != 0 || ECB.events_errorecb().read() != 0);
+    ECB.intenclr().write(|w| {
+        w.set_endecb(true);
+        w.set_errorecb(true);
+    });
     compiler_fence(Ordering::SeqCst);
     ECB.events_endecb().read() != 0 && ECB.events_errorecb().read() == 0
 }

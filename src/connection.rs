@@ -1257,16 +1257,17 @@ impl Connection {
     }
 
     /// Logs the counters since the last call.
-    fn report(&mut self, late: u32) {
+    fn report(&mut self, (late, lead): (u32, u32)) {
         let (last, last_late) = self.reported;
         info!(
-            "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal, {} dBm, drift {} of +-{} us",
+            "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
             self.stats.events.wrapping_sub(last.events),
             self.stats.skipped.wrapping_sub(last.skipped),
             self.stats.missed.wrapping_sub(last.missed),
             self.stats.crc_errors.wrapping_sub(last.crc_errors),
             self.stats.received.wrapping_sub(last.received),
             late.wrapping_sub(last_late),
+            lead,
             tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()),
             self.drift.0,
             self.drift.1
@@ -1453,7 +1454,7 @@ impl Connection {
                 break ended;
             }
             if reached(clock.now(), self.report_at) {
-                self.report(clock.late());
+                self.report((clock.late(), clock.lead()));
             }
             self.counter = self.counter.wrapping_add(1);
         };

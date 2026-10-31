@@ -5,7 +5,7 @@ use crate::{
     advertiser::legacy::{self, Kind, Settings},
     clock::Clock,
     connection::{Connection, Ended},
-    hci::{ConnectionParams, Packet, Shared, random},
+    hci::{ConnectionParams, Packet, Shared},
     log::info,
     pdu::BUFFER_LEN,
     radio::Radio,
@@ -44,13 +44,14 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
     true
 }
 
-/// Time until the next advertising event.
-fn interval(settings: &Settings) -> u32 {
+/// Time until the next advertising event. The random delay comes from the
+/// RNG interrupt while other tasks run.
+async fn interval(settings: &Settings) -> u32 {
     if settings.kind == Kind::DirectedHighDuty {
         return HIGH_DUTY_INTERVAL_US;
     }
     let mut jitter = [0_u8; 2];
-    random(&mut jitter);
+    crate::rng::fill_async(&mut jitter).await;
     settings.interval.saturating_add(u32::from(u16::from_le_bytes(jitter)).checked_rem(ADV_DELAY_MAX_US).unwrap_or(0))
 }
 
@@ -83,7 +84,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let (primary, scan_response) = settings.pdus();
         let started = clock.now();
         let Some((request, end)) = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx) else {
-            let next = started.wrapping_add(interval(&settings));
+            let next = started.wrapping_add(interval(&settings).await);
             if !clock.sleep_until(next, shared.changed()).await {
                 since = None;
             }
