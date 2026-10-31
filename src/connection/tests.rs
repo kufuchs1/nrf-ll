@@ -339,6 +339,18 @@ fn peripheral_latency_is_used_only_without_pending_work() {
     link.queue.fill(None);
     link.encryption.phase = Phase::Starting;
     assert!(!link.can_skip(&shared));
+    link.encryption.phase = Phase::Idle;
+    assert!(link.can_skip(&shared));
+    link.phy_update = Some((Phy::M2, 10));
+    assert!(!link.can_skip(&shared));
+}
+
+#[test]
+fn window_widening_stops_at_half_the_interval_less_the_interframe_space() {
+    let link = connection();
+    assert_eq!(link.interval, 15_000);
+    assert_eq!(link.widening(1_000_000), 1016);
+    assert_eq!(link.widening(60_000_000), 7350);
 }
 
 #[test]

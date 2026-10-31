@@ -37,8 +37,9 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   signal weakens or the central does not acknowledge a packet; after that it waits 64 packets before stepping down. A
   central that asked for a power has measured the device's signal itself, so the link layer never steps below that
   power on its own until the central asks for less. Advertising always uses 0 dBm.
-- **Peripheral latency:** used while nothing is waiting to be sent; data from the host ends the skipping at the next
-  connection event.
+- **Peripheral latency:** used while nothing is waiting to be sent and no connection or PHY update waits for its
+  instant; data from the host ends the skipping at the next connection event. The receive window widens with the time
+  since the last anchor, up to half the interval less the interframe space.
 
 ## Crypto for the host
 

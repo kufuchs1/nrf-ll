@@ -144,6 +144,8 @@ const UNIT_1250_US: u32 = 1250;
 const VERSION: [u8; 5] = [0x0B, 0xFF, 0xFF, 0x00, 0x00];
 /// Fixed part of the window widening in microseconds.
 const WIDENING_FIXED_US: u32 = 16;
+/// Interframe space.
+const T_IFS_US: u32 = 150;
 
 /// Why a connection ended.
 #[derive(Clone, Copy)]
@@ -535,9 +537,13 @@ impl Connection {
     }
 
     /// Whether the current event can pass without listening: nothing to send
-    /// or acknowledge and no procedure running.
+    /// or acknowledge and no procedure running. As in Zephyr, latency also
+    /// stops while a connection or PHY update waits for its instant, so the
+    /// anchor is fresh when the timing or the PHY changes.
     fn can_skip(&self, shared: &Shared) -> bool {
         matches!(self.expect, Expect::Anchor)
+            && self.param_update.is_none()
+            && self.phy_update.is_none()
             && self.tx_kind == TxKind::Empty
             && self.queue.iter().all(Option::is_none)
             && self.terminate.is_none()
@@ -1443,10 +1449,14 @@ impl Connection {
         self.encryption.phase = Phase::AwaitingEntropy { rand, ediv };
     }
 
-    /// Window widening after `elapsed` microseconds since the last anchor.
+    /// Window widening after `elapsed` microseconds since the last anchor,
+    /// at most half the interval less the interframe space (Core, Vol 6,
+    /// Part B, 4.5.7), as Zephyr limits it: wider windows would overlap the
+    /// neighbouring events.
     fn widening(&self, elapsed: u32) -> u32 {
         let drift = u64::from(elapsed).saturating_mul(u64::from(self.sca_ppm)).div_ceil(1_000_000);
-        u32::try_from(drift).unwrap_or(u32::MAX).saturating_add(WIDENING_FIXED_US)
+        let limit = (self.interval >> 1_u32).saturating_sub(T_IFS_US);
+        u32::try_from(drift).unwrap_or(u32::MAX).saturating_add(WIDENING_FIXED_US).min(limit)
     }
 
     /// Radio start and access address deadline of the current event.
