@@ -30,8 +30,6 @@ const DIRECTION_OFFSET: usize = 24;
 const IV_OFFSET: usize = 25;
 /// Busy-wait iterations for a decryption to finish after the packet end.
 const DECRYPT_WAIT: u32 = 2000;
-/// Fixed PPI channel: RADIO READY to CCM KSGEN.
-const PPI_KSGEN: usize = 24;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 const PPI_CRYPT: usize = 25;
 /// Scratch space for every value of an untrusted eight-bit length field.
@@ -60,17 +58,18 @@ pub unsafe fn arm_decrypt(
     CCM.mode().write(|w| {
         w.set_mode(Mode::Decryption);
         w.set_datarate(datarate(phy));
-        w.set_length(Length::Default);
+        w.set_length(Length::Extended);
     });
     set_pointers(config, input.cast_const(), output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
-    PPI.chenset().write(|w| {
-        w.set_ch(PPI_KSGEN, true);
-        w.set_ch(PPI_CRYPT, true);
-    });
+    compiler_fence(Ordering::SeqCst);
+    // The key stream for a payload of up to 251 octets is generated now,
+    // well before the access address starts the decryption, as in Zephyr.
+    CCM.tasks_ksgen().write_value(1);
+    PPI.chenset().write(|w| w.set_ch(PPI_CRYPT, true));
 }
 
 /// Prepares the CCM to encrypt `input` into `output` while it is sent.
@@ -93,14 +92,16 @@ pub unsafe fn arm_encrypt(
     CCM.mode().write(|w| {
         w.set_mode(Mode::Encryption);
         w.set_datarate(datarate(phy));
-        w.set_length(Length::Default);
+        w.set_length(Length::Extended);
     });
     set_pointers(config, input, output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     CCM.events_endksgen().write_value(0);
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
-    PPI.chenset().write(|w| w.set_ch(PPI_KSGEN, true));
+    compiler_fence(Ordering::SeqCst);
+    // The packet is encrypted at once, ahead of the radio reading it.
+    CCM.tasks_ksgen().write_value(1);
 }
 
 /// The CCM data rate matching `phy`, for decryption on the fly.
@@ -131,10 +132,7 @@ pub fn config(key: [u8; 16], iv: [u8; 8], central_to_peripheral: bool) -> [u8; C
 /// Stops starting the CCM from the radio.
 #[inline]
 pub fn disarm() {
-    PPI.chenclr().write(|w| {
-        w.set_ch(PPI_KSGEN, true);
-        w.set_ch(PPI_CRYPT, true);
-    });
+    PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
 }
 

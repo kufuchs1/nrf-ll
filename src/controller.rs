@@ -95,6 +95,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         radio.set_crc_init(request.crc_init);
         let mut connection = Connection::new(&request, end);
         connection.set_preferred_phys(shared.preferred_phys());
+        connection.set_suggested_length(shared.suggested_length());
         let central = request.central();
         let mut shown = central.address;
         shown.reverse();

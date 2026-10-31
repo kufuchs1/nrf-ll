@@ -11,7 +11,7 @@ use crate::{
     channel::{Hopping, UsedChannels},
     clock::{Clock, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
-    hci::{ConnectionParams, Packet, Shared},
+    hci::{ACL_MAX, AclOut, ConnectionParams, LENGTH_DEFAULT, LENGTH_MAX, Packet, Shared},
     log::info,
     pdu::{BUFFER_LEN, ConnectInd, LLID_MASK, Llid, NESN, SN, field, valid_channel_map, valid_connection_parameters},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
@@ -25,8 +25,8 @@ use entropy::Prefetch;
 const CONTROL_PAYLOAD_MAX: usize = 27;
 /// Data PDU header in RAM: header, length and the RFU byte the CCM needs.
 const DATA_HEADER_LEN: usize = 3;
-/// Size of a data PDU buffer with a MIC.
-const DATA_BUFFER_LEN: usize = DATA_HEADER_LEN + CONTROL_PAYLOAD_MAX + MIC_LEN;
+/// Size of a data PDU buffer with the longest payload and a MIC.
+const DATA_BUFFER_LEN: usize = DATA_HEADER_LEN + ACL_MAX + MIC_LEN;
 /// Error code: MIC failure.
 const ERROR_MIC_FAILURE: u8 = 0x3D;
 /// Error code: PIN or key missing.
@@ -50,6 +50,11 @@ const ERROR_UNSUPPORTED_VALUE: u8 = 0x20;
 /// Error code: connection failed to be established, no packet from the
 /// central within six connection events.
 const ERROR_FAILED_TO_ESTABLISH: u8 = 0x3E;
+/// Error: unacceptable connection parameters.
+const ERROR_UNACCEPTABLE_PARAMETERS: u8 = 0x3B;
+/// Time the host gets to answer a central's connection parameter request,
+/// well within the central's procedure timeout.
+const HOST_REPLY_US: u32 = 30_000_000;
 /// Maximum time allowed for an encryption procedure.
 const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 /// Supported link layer features.
@@ -58,9 +63,11 @@ const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 /// reject indication, the peripheral-initiated feature exchange and LE ping
 /// (bits 0 to 4), the LE 2M PHY (bit 8), channel selection algorithm 2 (bit
 /// 14) and LE power control (bits 33 and 34).
-pub const FEATURES: [u8; 8] = [0x1F, 0x41, 0, 0, 0x06, 0, 0, 0];
-/// Data length response payload: 27 octets and 328 us both ways.
-const LENGTH: [u8; 8] = [27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01];
+pub const FEATURES: [u8; 8] = [0x1F | FEATURE_DATA_LENGTH, 0x41, 0, 0, 0x06, 0, 0, 0];
+/// Feature bit in the first octet: LE data packet length extension.
+const FEATURE_DATA_LENGTH: u8 = 0x20;
+/// Longest time on the air of a data PDU the specification allows.
+const LENGTH_TIME_MAX: u16 = 17_040;
 /// Length of a message integrity check.
 const MIC_LEN: usize = 4;
 /// Connection parameter change at an instant.
@@ -293,6 +300,80 @@ enum Expect {
     },
 }
 
+/// Data length extension (Core, Vol 6, Part B, 4.5.10): the longest payload
+/// in octets and its time on the air in microseconds, each way.
+#[derive(Clone, Copy)]
+struct DataLength {
+    /// What the host lets this side send.
+    local_tx: [u16; 2],
+    /// What the central receives, as it said.
+    peer_rx:  [u16; 2],
+    /// What the central sends, as it said.
+    peer_tx:  [u16; 2],
+    /// Effective values last reported to the host: transmit octets and
+    /// time, receive octets and time.
+    reported: [u16; 4],
+}
+
+impl DataLength {
+    /// Effective transmit octets and time and receive octets and time.
+    fn effective(&self) -> [u16; 4] {
+        let [default_octets, default_time] = LENGTH_DEFAULT;
+        let [max_octets, max_time] = LENGTH_MAX;
+        [
+            self.local_tx[0].min(self.peer_rx[0]),
+            self.local_tx[1].min(self.peer_rx[1]).max(default_time),
+            max_octets.min(self.peer_tx[0]).max(default_octets),
+            max_time.min(self.peer_tx[1]).max(default_time),
+        ]
+    }
+
+    /// The defaults until the procedure ran, with what the host lets this
+    /// side send.
+    const fn new(local_tx: [u16; 2]) -> Self {
+        let [octets, time] = LENGTH_DEFAULT;
+        Self { local_tx, peer_rx: LENGTH_DEFAULT, peer_tx: LENGTH_DEFAULT, reported: [octets, time, octets, time] }
+    }
+
+    /// The payload of `LL_LENGTH_REQ` and `LL_LENGTH_RSP`: the longest
+    /// supported reception and what this side may send.
+    fn pdu(&self, code: u8) -> [u8; 9] {
+        let mut pdu = [code, 0, 0, 0, 0, 0, 0, 0, 0];
+        let [max_octets, max_time] = LENGTH_MAX;
+        let values = [max_octets, max_time, self.local_tx[0], self.local_tx[1]];
+        for (target, source) in pdu.iter_mut().skip(1).zip(values.iter().flat_map(|value| value.to_le_bytes())) {
+            *target = source;
+        }
+        pdu
+    }
+
+    /// Takes the central's values from its `LL_LENGTH_REQ` or `LL_LENGTH_RSP`,
+    /// within the specification's range.
+    fn take_peer(&mut self, params: &[u8]) {
+        let Some(bytes) = field::<8>(params, 0) else { return };
+        let mut values = [0_u16; 4];
+        let (pairs, _) = bytes.as_chunks::<2>();
+        for (value, &pair) in values.iter_mut().zip(pairs) {
+            *value = u16::from_le_bytes(pair);
+        }
+        let [rx_octets, rx_time, tx_octets, tx_time] = values;
+        let [default_octets, default_time] = LENGTH_DEFAULT;
+        let octets = |value: u16| value.clamp(default_octets, LENGTH_MAX[0]);
+        let time = |value: u16| value.clamp(default_time, LENGTH_TIME_MAX);
+        self.peer_rx = [octets(rx_octets), time(rx_time)];
+        self.peer_tx = [octets(tx_octets), time(tx_time)];
+    }
+}
+
+/// A central's connection parameter request waiting for an answer.
+#[derive(Clone, Copy)]
+struct RemoteRequest {
+    /// Whether the host was asked, and until when it may answer.
+    asked:  Option<u32>,
+    /// The request's parameters, whose offsets the response repeats.
+    params: [u8; 23],
+}
+
 /// A received PDU in plain text, waiting to be processed.
 #[derive(Clone, Copy)]
 struct Pending {
@@ -316,8 +397,10 @@ struct Queued {
 /// Kind of the PDU being sent.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TxKind {
-    /// ACL data from the host.
+    /// The last fragment of ACL data from the host.
     Acl,
+    /// A fragment of ACL data from the host with more to follow.
+    AclPart,
     /// LL control PDU.
     Control,
     /// Empty PDU.
@@ -352,6 +435,8 @@ struct Update {
 pub struct Connection {
     /// Fatal controller error; no further packets may be sent.
     abort:                  Option<u8>,
+    /// The host's ACL packet being sent in fragments, and its octets sent.
+    acl:                    Option<(AclOut, u8)>,
     /// Access address time of the last received packet.
     anchor:                 u32,
     /// Event counter of [`Self::anchor`].
@@ -394,6 +479,10 @@ pub struct Connection {
     last_valid:             u32,
     /// Peripheral latency in events.
     latency:                u16,
+    /// Data length extension state.
+    length:                 DataLength,
+    /// The data length procedure this side starts.
+    length_request:         Request,
     /// Used data channels.
     map:                    UsedChannels,
     /// Next expected sequence number.
@@ -438,6 +527,8 @@ pub struct Connection {
     queue:                  [Option<Queued>; QUEUE_LEN],
     /// Whether the received PDU is new and has to be processed.
     received:               bool,
+    /// A central's connection parameter request waiting for an answer.
+    remote_request:         Option<RemoteRequest>,
     /// Time of the next statistics log.
     report_at:              u32,
     /// Counters and crystal restarts at the last statistics log.
@@ -494,7 +585,7 @@ impl Connection {
                         self.terminate = Some((reason, true));
                     }
                 },
-                TxKind::Control | TxKind::Empty => {},
+                TxKind::AclPart | TxKind::Control | TxKind::Empty => {},
             }
             self.load_next(shared);
             if self.abort.is_some() {
@@ -649,6 +740,9 @@ impl Connection {
     /// Services host traffic before the next radio event.
     fn drive_host(&mut self, now: u32, shared: &Shared, entropy: &Prefetch) {
         self.drive_encryption(shared, entropy);
+        self.drive_remote_request(now, shared);
+        self.drive_length(shared);
+        shared.set_rssi(for_phy_mut(&mut self.power, self.tx_phy).average_dbm());
         self.service_queries(now, shared);
         self.start_procedures(now, shared);
     }
@@ -787,17 +881,21 @@ impl Connection {
     }
 
     /// Air time of a full exchange after the current packet: our answer, and
-    /// one more packet each way, at their longest.
+    /// one more packet each way, at the longest the data lengths allow.
     fn exchange_us(&self) -> u32 {
-        let packet = |phy: Phy| {
-            // Header, the longest payload with its MIC, and the CRC.
-            let bytes = u32::try_from(DATA_BUFFER_LEN).unwrap_or(u32::MAX).saturating_add(3);
-            phy.address_offset_us().saturating_add(bytes.saturating_mul(8).checked_div(phy.hci().into()).unwrap_or(0))
+        // Header, payload, MIC and CRC after the preamble and access
+        // address. The S1 byte in RAM is counted as well, which errs on the
+        // long side.
+        let packet = |phy: Phy, payload: usize, mic: bool| {
+            let bytes =
+                DATA_HEADER_LEN.saturating_add(payload).saturating_add(if mic { MIC_LEN } else { 0 }).saturating_add(3);
+            let octets = u32::try_from(bytes).unwrap_or(u32::MAX);
+            phy.address_offset_us().saturating_add(octets.saturating_mul(8).checked_div(phy.hci().into()).unwrap_or(0))
         };
-        packet(self.tx_phy)
-            .saturating_mul(2)
-            .saturating_add(packet(self.phy))
-            .saturating_add(T_IFS_US.saturating_mul(3))
+        let [_, _, rx_octets, _] = self.length.effective();
+        let answer = packet(self.tx_phy, self.tx_payload_max(), self.encryption.tx_on);
+        let next = packet(self.phy, usize::from(rx_octets), self.encryption.rx_on);
+        answer.saturating_mul(2).saturating_add(next).saturating_add(T_IFS_US.saturating_mul(3))
     }
 
     /// Updates the encryption phases and the anchor after an exchange whose
@@ -958,16 +1056,17 @@ impl Connection {
                 self.version_request = Request::Done;
                 self.version = params.first_chunk::<5>().copied();
             },
-            OP_LENGTH_REQ => {
-                let mut response = [OP_LENGTH_RSP, 0, 0, 0, 0, 0, 0, 0, 0];
-                if let Some(target) = response.get_mut(1..) {
-                    target.copy_from_slice(&LENGTH);
+            OP_LENGTH_REQ | OP_LENGTH_RSP => {
+                self.length.take_peer(params);
+                if code == OP_LENGTH_REQ {
+                    self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_RSP));
+                } else {
+                    self.length_request = Request::Done;
                 }
-                self.enqueue(Llid::Control, &response);
             },
             OP_PING_REQ => self.enqueue(Llid::Control, &[OP_PING_RSP]),
             OP_PING_RSP => self.ping_request = None,
-            OP_VERSION_IND | OP_LENGTH_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {},
+            OP_VERSION_IND | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {},
             _ => self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, code]),
         }
         info!("control {=u8:#04x}", code);
@@ -1032,22 +1131,21 @@ impl Connection {
     fn load_next(&mut self, shared: &Shared) {
         let queued = self.queue.first_mut().and_then(Option::take);
         self.queue.rotate_left(1);
-        let take_acl = queued.is_none() && self.encryption.phase == Phase::Idle;
-        let (kind, llid, data, len) = match (queued, shared.next_acl_out_if(take_acl)) {
-            (Some(control), _) => {
-                let kind =
-                    if control.data.first() == Some(&OP_TERMINATE_IND) { TxKind::Terminate } else { TxKind::Control };
-                (kind, control.llid, control.data, control.len)
-            },
-            (None, Some(acl)) => (TxKind::Acl, acl.llid, acl.data, acl.len),
-            (None, None) => (TxKind::Empty, Llid::Continuation, [0; CONTROL_PAYLOAD_MAX], 0),
+        let (kind, llid, len) = if let Some(control) = queued {
+            let kind =
+                if control.data.first() == Some(&OP_TERMINATE_IND) { TxKind::Terminate } else { TxKind::Control };
+            let size = usize::from(control.len);
+            if let (Some(target), Some(source)) =
+                (self.tx.get_mut(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(size)), control.data.get(..size))
+            {
+                target.copy_from_slice(source);
+            }
+            (kind, control.llid, control.len)
+        } else if let Some(fragment) = self.next_fragment(shared) {
+            fragment
+        } else {
+            (TxKind::Empty, Llid::Continuation, 0)
         };
-        if let (Some(target), Some(source)) = (
-            self.tx.get_mut(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(usize::from(len))),
-            data.get(..usize::from(len)),
-        ) {
-            target.copy_from_slice(source);
-        }
         if let Some(header) = self.tx.first_chunk_mut::<DATA_HEADER_LEN>() {
             *header = [llid.bits(), len, 0];
         }
@@ -1071,6 +1169,9 @@ impl Connection {
             end.wrapping_add(UNIT_1250_US).wrapping_add(u32::from(request.win_offset).saturating_mul(UNIT_1250_US));
         Self {
             abort: None,
+            acl: None,
+            length: DataLength::new(LENGTH_DEFAULT),
+            length_request: Request::NotStarted,
             notifications: [None; 3],
             anchor: end,
             anchor_counter: 0,
@@ -1121,6 +1222,7 @@ impl Connection {
             reported: (Stats::default(), 0),
             queue: [None; QUEUE_LEN],
             pending: [None; RX_SLOTS],
+            remote_request: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
@@ -1142,6 +1244,37 @@ impl Connection {
             phy_status: None,
             preferred_phys: [PREFERRED_PHYS; 2],
         }
+    }
+
+    /// Copies the next fragment of the host's ACL data into the transmit
+    /// buffer: the data a host packet holds beyond the fragments sent, as
+    /// much as the central receives. Returns its kind, LLID and length, or
+    /// `None` without data or while an encryption procedure runs.
+    fn next_fragment(&mut self, shared: &Shared) -> Option<(TxKind, Llid, u8)> {
+        if self.encryption.phase != Phase::Idle {
+            return None;
+        }
+        if self.acl.is_none() {
+            self.acl = shared.next_acl_out_if(true).map(|packet| (packet, 0));
+        }
+        let limit = self.tx_payload_max();
+        let current = self.acl.as_mut()?;
+        let packet = &current.0;
+        let start = usize::from(current.1);
+        let size = usize::from(packet.len).saturating_sub(start).min(limit);
+        let end = start.saturating_add(size);
+        if let (Some(target), Some(source)) =
+            (self.tx.get_mut(DATA_HEADER_LEN..DATA_HEADER_LEN.saturating_add(size)), packet.data.get(start..end))
+        {
+            target.copy_from_slice(source);
+        }
+        let llid = if start == 0 { packet.llid } else { Llid::Continuation };
+        let last = end >= usize::from(packet.len);
+        current.1 = u8::try_from(end).unwrap_or(u8::MAX);
+        if last {
+            self.acl = None;
+        }
+        Some((if last { TxKind::Acl } else { TxKind::AclPart }, llid, u8::try_from(size).unwrap_or(u8::MAX)))
     }
 
     /// Counts a missed event and moves an expected transmit window to the
@@ -1196,7 +1329,7 @@ impl Connection {
                 },
                 Some(payload) if len != 0 => {
                     let kind = if header & LLID_MASK == Llid::Start.bits() { Llid::Start } else { Llid::Continuation };
-                    _ = shared.push_acl_in(Packet::acl(kind, payload));
+                    _ = shared.push_acl_in(kind, payload);
                 },
                 Some(_) | None => {},
             }
@@ -1224,7 +1357,7 @@ impl Connection {
     /// NESN still acknowledges TX, as in the Core receive sequence and Zephyr.
     fn receive(&mut self, header: u8, len: u8, mic_ok: bool, address: u32, shared: &Shared) -> Option<bool> {
         let llid = header & LLID_MASK;
-        let maximum = CONTROL_PAYLOAD_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
+        let maximum = ACL_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
         if llid == 0 || usize::from(len) > maximum || (len == 0 && llid != Llid::Continuation.bits()) {
             self.abort = Some(ERROR_INVALID_PARAMETERS);
             return None;
@@ -1546,6 +1679,10 @@ impl Connection {
     /// Applies the default PHY preference when establishing a new link.
     pub(crate) const fn set_preferred_phys(&mut self, preferences: [u8; 2]) { self.preferred_phys = preferences; }
 
+    /// Applies the host's suggested data length when establishing a new
+    /// link: the longest payload and time this side may send.
+    pub(crate) const fn set_suggested_length(&mut self, length: [u16; 2]) { self.length = DataLength::new(length); }
+
     /// Answers an encryption request: sends the peripheral's session key
     /// diversifier and IV and asks the host for the long term key.
     fn start_encryption(&mut self, params: &[u8]) {
@@ -1573,25 +1710,38 @@ impl Connection {
     fn stash(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool) {
         self.received = false;
         self.stats.received = self.stats.received.wrapping_add(1);
-        let mut bytes = [0_u8; DATA_BUFFER_LEN];
         // Empty PDUs have no MIC and need not produce a CCM output packet.
         let source = if encrypted && rx.get(1) != Some(&0) { self.rx_plain.as_slice() } else { rx.as_slice() };
-        if let Some(chunk) = source.first_chunk::<DATA_BUFFER_LEN>() {
-            bytes = *chunk;
-        }
-        let [header, len, ..] = bytes;
+        let header = source.first().copied().unwrap_or_default();
+        let len = source.get(1).copied().unwrap_or_default();
         if encrypted && len != 0 {
             self.encryption.rx_counter = self.encryption.rx_counter.saturating_add(1);
         }
         if len != 0 || header & MD != 0 {
             self.skipped = self.latency;
         }
+        // Copied straight into its slot: the link layer interrupt keeps no
+        // packet-sized copy on its stack.
         if len != 0
             && let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none())
         {
-            *slot = Some(Pending { bytes, encrypted });
+            let held = slot.insert(Pending { bytes: [0; DATA_BUFFER_LEN], encrypted });
+            if let Some(chunk) = source.first_chunk::<DATA_BUFFER_LEN>() {
+                held.bytes.copy_from_slice(chunk);
+            }
         }
-        crypto::wipe(&mut bytes);
+    }
+
+    /// Longest payload this side may send now: the effective octets, and as
+    /// many as fit the effective time on the transmit PHY with the MIC.
+    fn tx_payload_max(&self) -> usize {
+        let [octets, time, ..] = self.length.effective();
+        let per_byte = 8_u32.checked_div(u32::from(self.tx_phy.hci())).unwrap_or(8);
+        let mic = if self.encryption.tx_on { MIC_LEN } else { 0 };
+        // Preamble and access address, header and CRC.
+        let overhead = self.tx_phy.address_offset_us().checked_div(per_byte).unwrap_or(0).saturating_add(5);
+        let by_time = u32::from(time).checked_div(per_byte).unwrap_or(0).saturating_sub(overhead);
+        usize::try_from(by_time).unwrap_or(0).saturating_sub(mic).min(usize::from(octets)).min(ACL_MAX)
     }
 
     /// Sleeps until an access address arrives or `deadline` passes, woken by

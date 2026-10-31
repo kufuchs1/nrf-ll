@@ -7,13 +7,17 @@ use super::{
     ERROR_INVALID_PARAMETERS,
     ERROR_PDU_NOT_ALLOWED,
     ERROR_RESPONSE_TIMEOUT,
+    ERROR_UNACCEPTABLE_PARAMETERS,
     ERROR_UNSUPPORTED_FEATURE,
     ERROR_UNSUPPORTED_VALUE,
+    FEATURE_DATA_LENGTH,
     FEATURES,
+    HOST_REPLY_US,
     OP_CONNECTION_PARAM_REQ,
     OP_CONNECTION_PARAM_RSP,
     OP_CONNECTION_UPDATE_IND,
     OP_FEATURE_RSP,
+    OP_LENGTH_REQ,
     OP_PERIPHERAL_FEATURE_REQ,
     OP_PHY_REQ,
     OP_PHY_RSP,
@@ -26,6 +30,7 @@ use super::{
     OP_UNKNOWN_RSP,
     PROCEDURE_TIMEOUT_US,
     Phase,
+    RemoteRequest,
     Request,
     STATUS_SUCCESS,
     UNIT_10MS_US,
@@ -37,7 +42,7 @@ use super::{
 };
 use crate::{
     clock::reached,
-    hci::{ConnectionParams, Packet, Shared},
+    hci::{ConnectionParams, LENGTH_DEFAULT, Packet, Shared},
     log::info,
     pdu::{Llid, field, valid_connection_parameters},
     power_control::LEVELS_DBM,
@@ -118,6 +123,78 @@ impl Connection {
         )
     }
 
+    /// Applies a data length the host set for the link, which starts the
+    /// procedure again, and tells the host of changed effective lengths
+    /// (LE Data Length Change).
+    pub(super) fn drive_length(&mut self, shared: &Shared) {
+        if let Some(length) = shared.take_data_length() {
+            self.length.local_tx = length;
+            if !matches!(self.length_request, Request::Requested(_)) {
+                self.length_request = Request::NotStarted;
+            }
+        }
+        let effective = self.length.effective();
+        if effective != self.length.reported {
+            self.length.reported = effective;
+            self.notify(Packet::data_length_change(effective), shared);
+            info!("data length now {} octets out, {} in", effective[0], effective[2]);
+        }
+    }
+
+    /// Asks the host about a central's connection parameter request and
+    /// answers the central as the host decides: with its parameters and the
+    /// central's offsets, or with a rejection. A host that does not answer
+    /// in [`HOST_REPLY_US`] has the request rejected. Without a host that
+    /// decides, the link layer accepts any valid request.
+    pub(super) fn drive_remote_request(&mut self, now: u32, shared: &Shared) {
+        let Some(request) = self.remote_request else { return };
+        if request.asked.is_none() && !shared.host_decides_parameters() {
+            // Any parameters the central proposes suit the device.
+            self.remote_request = None;
+            let mut response = [0_u8; 24];
+            for (target, source) in
+                response.iter_mut().zip(core::iter::once(&OP_CONNECTION_PARAM_RSP).chain(&request.params))
+            {
+                *target = *source;
+            }
+            self.enqueue(Llid::Control, &response);
+            return;
+        }
+        let Some(deadline) = request.asked else {
+            let field = |index: usize| {
+                let bytes = request.params.get(index..index.saturating_add(2)).unwrap_or_default();
+                bytes.first_chunk::<2>().map_or(0, |&pair| u16::from_le_bytes(pair))
+            };
+            self.notify(Packet::remote_parameter_request([field(0), field(2), field(4), field(6)]), shared);
+            shared.ask_parameters();
+            self.remote_request = Some(RemoteRequest { asked: Some(now.wrapping_add(HOST_REPLY_US)), ..request });
+            return;
+        };
+        let reply = match shared.take_parameter_reply() {
+            Some(reply) => reply,
+            None if reached(now, deadline) => {
+                shared.end_parameter_request();
+                Err(ERROR_UNACCEPTABLE_PARAMETERS)
+            },
+            None => return,
+        };
+        self.remote_request = None;
+        match reply {
+            Ok(values) => {
+                let mut response = [0_u8; 24];
+                let host = values.iter().flat_map(|value| value.to_le_bytes());
+                let offsets = request.params.iter().skip(8).copied();
+                for (target, source) in
+                    response.iter_mut().zip(core::iter::once(OP_CONNECTION_PARAM_RSP).chain(host).chain(offsets))
+                {
+                    *target = source;
+                }
+                self.enqueue(Llid::Control, &response);
+            },
+            Err(reason) => self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]),
+        }
+    }
+
     /// Answers the feature exchange of the central, and takes its answer to
     /// ours. The first byte holds the features both sides use.
     pub(super) fn handle_features(&mut self, code: u8, params: &[u8]) {
@@ -184,15 +261,12 @@ impl Connection {
                         OP_CONNECTION_PARAM_REQ,
                         ERROR_DIFFERENT_TRANSACTION,
                     ]);
+                } else if let Some(&request) = params.first_chunk::<23>() {
+                    // Answered before the next event, by the host if it
+                    // decides on such requests.
+                    self.remote_request = Some(RemoteRequest { asked: None, params: request });
                 } else {
-                    // Any parameters the central proposes suit the device.
-                    let mut response = [0_u8; 24];
-                    for (target, source) in
-                        response.iter_mut().zip(core::iter::once(&OP_CONNECTION_PARAM_RSP).chain(params))
-                    {
-                        *target = *source;
-                    }
-                    self.enqueue(Llid::Control, &response);
+                    // Too short: `valid_request` let it through.
                 }
             },
             _ => {},
@@ -316,6 +390,7 @@ impl Connection {
                 }
             },
             OP_PING_REQ => self.ping_request = None,
+            OP_LENGTH_REQ => self.length_request = Request::Done,
             OP_CONNECTION_PARAM_REQ if self.param_request.is_some() => {
                 self.param_request = None;
                 self.param_status = Some(error);
@@ -351,7 +426,7 @@ impl Connection {
             self.abort = Some(ERROR_RESPONSE_TIMEOUT);
             return;
         }
-        if [self.features_request, self.phy_request]
+        if [self.features_request, self.phy_request, self.length_request]
             .iter()
             .any(|request| matches!(request, Request::Requested(deadline) if reached(now, *deadline)))
         {
@@ -363,10 +438,12 @@ impl Connection {
             && self.phy_update.is_none()
             && self.channel_update.is_none()
             && self.queue.iter().all(Option::is_none)
-            && self.notifications.iter().all(Option::is_none);
-        let ours_running =
-            [self.features_request, self.phy_request].iter().any(|request| matches!(request, Request::Requested(_)))
-                || self.param_request.is_some();
+            && self.notifications.iter().all(Option::is_none)
+            && self.remote_request.is_none();
+        let ours_running = [self.features_request, self.phy_request, self.length_request]
+            .iter()
+            .any(|request| matches!(request, Request::Requested(_)))
+            || self.param_request.is_some();
         if !idle || ours_running {
             return;
         }
@@ -388,6 +465,14 @@ impl Connection {
             let [tx, rx] = self.preferred_phys;
             self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
             self.phy_request = Request::Requested(deadline);
+        } else if self.length_request == Request::NotStarted
+            && self.length.local_tx != LENGTH_DEFAULT
+            && self.central_features.is_some_and(|[first, ..]| first & FEATURE_DATA_LENGTH != 0)
+        {
+            // The host lets this side send longer packets than the default:
+            // the central learns it, and of the longest this side receives.
+            self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_REQ));
+            self.length_request = Request::Requested(deadline);
         } else if let Some([min, max, latency, timeout]) = shared.take_param_request() {
             let current = self.current_params();
             if (min..=max).contains(&current.interval) && latency == current.latency && timeout == current.timeout {

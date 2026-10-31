@@ -12,9 +12,13 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   advertising keeps running; peer addresses in the resolving list are resolved for the filter accept list and for
   directed advertising. A reset forgets every key the host gave.
 - **Connections:** as peripheral, with channel selection algorithm 1 or 2, as the central chooses. It answers the LL
-  control procedures a central starts and accepts any valid connection parameters a central asks for. Every packet
+  control procedures a central starts. A host that enabled the LE remote connection parameter request event decides on
+  the parameters a central asks for, with LE Remote Connection Parameter Request Reply or Negative Reply (TrouBLE's
+  `connection-params-update` feature), and has them rejected if it does not answer in 30 s; otherwise the link layer
+  accepts any valid parameters. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
+- **Read RSSI** answers with the averaged signal strength of the central's packets.
 - **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the
   plain one. Keys the host gave, and the keys of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
@@ -24,6 +28,13 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   an LL response timeout, as any other procedure does.
 - **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
   previous one reported its LE Connection Update Complete event.
+- **Data length extension:** payloads of up to 251 octets each way instead of 27. The link layer receives 251 octets
+  from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer packets once the host allows them for
+  the link (LE Set Data Length, TrouBLE's `Connection::update_data_length`) or for new links (LE Write Suggested
+  Default Data Length), and then asks the central itself; the host learns the effective lengths from LE Data Length
+  Change. The host's ACL packets hold up to 251 octets and are sent in fragments as long as the central receives,
+  within its time on the air. The CCM runs in extended length mode and generates its key stream when it is armed, as
+  in Zephyr, instead of at radio READY.
 - **LE 2M PHY** when the central supports it, which halves the airtime of every packet: the link layer asks for it once
   the link is encrypted and answers the central's own request. Both directions use the same PHY, as the radio switches
   PHYs only while it is disabled.
@@ -70,9 +81,10 @@ polling them. Their interrupts stay disabled in the NVIC and only mark themselve
 `TIMER0` interrupts disabled there. Only the short waits for an RTC compare a few ticks ahead also wake on the RTC tick
 (30.5 µs).
 
-The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 10 µs shorter after each restart
-whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs. A
-late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s connection report shows the lead.
+The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 2 µs shorter after each restart
+whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs, so
+about 2 % of restarts find it late. A late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s
+connection report shows the lead.
 
 The random delay of each advertising event and the entropy of each encryption start come from the RNG interrupt while
 other tasks run: bind and enable `RNG` to `rng::on_interrupt`.
