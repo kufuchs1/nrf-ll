@@ -70,9 +70,10 @@ polling them. Their interrupts stay disabled in the NVIC and only mark themselve
 `TIMER0` interrupts disabled there. Only the short waits for an RTC compare a few ticks ahead also wake on the RTC tick
 (30.5 µs).
 
-The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 10 µs shorter after each restart
-whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs. A
-late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s connection report shows the lead.
+The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 2 µs shorter after each restart
+whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs, so
+about 2 % of restarts find it late. A late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s
+connection report shows the lead.
 
 The random delay of each advertising event and the entropy of each encryption start come from the RNG interrupt while
 other tasks run: bind and enable `RNG` to `rng::on_interrupt`.

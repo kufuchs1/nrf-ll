@@ -62,8 +62,10 @@ const CRYSTAL_RETRY_US: u32 = 2000;
 const CRYSTAL_LEAD_US: u32 = 800;
 /// Bounds of the crystal lead time.
 const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
-/// Lead time given up after a restart whose crystal ran early.
-const CRYSTAL_LEAD_DOWN_US: u32 = 10;
+/// Lead time given up after a restart whose crystal ran early. With the
+/// step up, it sets how many restarts find the crystal late once the lead
+/// settled: 2 / (2 + 100), about 2 %.
+const CRYSTAL_LEAD_DOWN_US: u32 = 2;
 /// Lead time added after a restart whose crystal was late.
 const CRYSTAL_LEAD_UP_US: u32 = 100;
 /// Time before TIMER0 restarts at which the task wakes to wait for it.
@@ -301,8 +303,8 @@ impl<'peripherals> Clock<'peripherals> {
     pub const fn late(&self) -> u32 { self.late }
 
     /// Time the crystal currently gets to start before an event. It shrinks
-    /// while the crystal runs at least 100 us before TIMER0 restarts and
-    /// grows when it was late, within 300 to 1500 us.
+    /// by 2 us while the crystal runs at least 100 us before TIMER0
+    /// restarts and grows by 100 us when it was late, within 300 to 1500 us.
     #[inline]
     #[must_use = "the lead time is only read"]
     pub const fn lead(&self) -> u32 { self.lead }
