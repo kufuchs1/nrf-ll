@@ -55,8 +55,9 @@ restarts TIMER0 at an exact tick before the next event. During radio events the 
 layer interrupt and wakes on the radio events, or at least every RTC tick (30.5 µs), instead of polling them. The RC
 oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
 once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
-`clock::calibrate_rc` takes the `TEMP` peripheral. Bind the `TEMP` interrupt to `clock::on_temperature_interrupt` and
-`CLOCK_POWER` to `clock::on_clock_interrupt` to wake it; without them it checks the events every millisecond instead.
+`clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable `TEMP` to
+`clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for its first
+temperature. A calibration whose crystal or end does not come within 100 ms is retried at the next interval.
 Dropping the calibration future releases the crystal. The crystal is shared through a reference count that changes
 with its start and stop task in one critical section, and a connection event that finds the crystal stopped starts it
 again before it listens.

@@ -42,11 +42,9 @@ const CC_END: usize = 2;
 const CC_NOW: usize = 3;
 /// Compare register starting the radio (PPI channels 20 and 21).
 const CC_START: usize = 0;
-/// Waits after which a calibration is given up, 100 ms in all.
-const CALIBRATION_WAITS_MAX: u32 = 50;
-/// Wait for the calibration after which the crystal is started again if it
-/// does not run, or the calibration if it does.
-const CALIBRATION_WAIT: Duration = Duration::from_millis(2);
+/// Time after which a calibration whose crystal or end never came is given
+/// up until the next interval.
+const CALIBRATION_TIMEOUT: Duration = Duration::from_millis(100);
 /// Programmable PPI channel: CLOCK HFCLKSTARTED to CLOCK CAL, while a
 /// calibration waits for the crystal.
 const PPI_CALIBRATE: usize = 3;
@@ -94,9 +92,6 @@ const SLEEP_MIN_US: u32 = 3000;
 /// counted down to zero but was preempted before stopping the crystal would
 /// otherwise stop it under a user that requested it in between.
 static CRYSTAL_USERS: CriticalSectionMutex<Cell<u8>> = CriticalSectionMutex::new(Cell::new(0));
-/// Longest wait for a temperature or calibration interrupt before the event
-/// is checked directly, so a missing interrupt binding only slows them down.
-const INTERRUPT_FALLBACK: Duration = Duration::from_millis(1);
 
 /// Free-running 32-bit microsecond time. Times wrap after 71 minutes, so
 /// they are compared with wrapping differences.
@@ -427,9 +422,9 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 ///
 /// Owns TEMP exclusively. The TEMP data-ready interrupt (calling
 /// [`on_temperature_interrupt`]) and the `CLOCK_POWER` interrupt (calling
-/// [`on_clock_interrupt`]) wake it; without them the events are checked
-/// every millisecond instead. Dropping the future releases the crystal and
-/// stops a running measurement.
+/// [`on_clock_interrupt`]) wake it, and both must be enabled: nothing polls
+/// the events. Dropping the future releases the crystal and stops a running
+/// measurement.
 ///
 /// As Nordic specifies it, the temperature is checked every
 /// [`CALIBRATION_INTERVAL`], and the oscillator calibrated when it changed by
@@ -458,9 +453,8 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
 /// Calibrates the RC oscillator once against the high frequency crystal.
 ///
 /// PPI starts the calibration when the crystal runs, and the clock interrupt
-/// wakes the task when it is done, so the CPU wakes twice. A crystal that
-/// does not start, or a start that was missed, is retried every
-/// [`CALIBRATION_WAIT`].
+/// wakes the task when it is done, so the CPU wakes twice. Gives up after
+/// [`CALIBRATION_TIMEOUT`] if the crystal or the end never comes.
 async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
     let channel = PPI.ch(PPI_CALIBRATE);
@@ -469,29 +463,12 @@ async fn calibrate() -> bool {
     PPI.chenset().write(|w| w.set_ch(PPI_CALIBRATE, true));
     request_crystal();
     let _calibration = Calibration;
-    // A crystal that already ran reports no start.
-    let mut started = crystal_running();
-    if started {
+    // A crystal that already ran reports no start. If it starts just now
+    // as well, the second start of the calibration is harmless.
+    if crystal_running() {
         CLOCK.tasks_cal().write_value(1);
     }
-    for _ in 0..CALIBRATION_WAITS_MAX {
-        if with_timeout(CALIBRATION_WAIT, calibration_done()).await.is_ok() || CLOCK.events_done().read() != 0 {
-            return true;
-        }
-        if crystal_running() {
-            // The start may have been reported before the PPI channel was
-            // set up. A running calibration is not restarted.
-            if !started {
-                CLOCK.tasks_cal().write_value(1);
-            }
-            started = true;
-        } else {
-            // PPI starts the calibration once the crystal reports its start.
-            started = false;
-            CLOCK.tasks_hfclkstart().write_value(1);
-        }
-    }
-    false
+    with_timeout(CALIBRATION_TIMEOUT, calibration_done()).await.is_ok()
 }
 
 /// Waits until the calibration is done.
@@ -544,19 +521,15 @@ async fn temperature() -> i32 {
     let _measurement = TemperatureMeasurement;
     TEMP.events_datardy().write_value(0);
     TEMP.tasks_start().write_value(1);
-    loop {
-        let ready = poll_fn(|cx| {
-            TEMPERATURE_READY.register(cx.waker());
-            if TEMP.events_datardy().read() != 0 {
-                return Poll::Ready(TEMP.temp().read().cast_signed());
-            }
-            TEMP.intenset().write(|w| w.set_datardy(true));
-            Poll::Pending
-        });
-        if let Ok(value) = with_timeout(INTERRUPT_FALLBACK, ready).await {
-            return value;
+    poll_fn(|cx| {
+        TEMPERATURE_READY.register(cx.waker());
+        if TEMP.events_datardy().read() != 0 {
+            return Poll::Ready(TEMP.temp().read().cast_signed());
         }
-    }
+        TEMP.intenset().write(|w| w.set_datardy(true));
+        Poll::Pending
+    })
+    .await
 }
 
 /// Whether the high frequency clock runs from the crystal.
