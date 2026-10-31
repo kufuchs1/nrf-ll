@@ -675,6 +675,8 @@ pub struct Shared {
     acl_in:          Channel<CriticalSectionRawMutex, AclIn, 2>,
     /// ACL data from the host for the air.
     acl_out:         Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
+    /// The host read ACL data from the air.
+    acl_taken:       Signal<CriticalSectionRawMutex, ()>,
     /// Advertising settings changed.
     changed:         Signal<CriticalSectionRawMutex, ()>,
     /// Data length the host set for the link: payload octets and time.
@@ -711,6 +713,14 @@ impl Default for Shared {
 }
 
 impl Shared {
+    /// Waits until the host read all ACL data received from the air, so
+    /// none is lost when a link ends.
+    pub(crate) async fn acl_in_drained(&self) {
+        while !self.acl_in.is_empty() {
+            self.acl_taken.wait().await;
+        }
+    }
+
     /// Free places for ACL data towards the host.
     #[inline]
     #[must_use = "the room is only read"]
@@ -751,6 +761,7 @@ impl Shared {
             *state = HostState::new(false, state.epoch.wrapping_add(1));
         });
         while self.events.try_receive().is_ok() {}
+        while self.acl_in.try_receive().is_ok() {}
         self.reset_done.signal(());
     }
 
@@ -789,6 +800,7 @@ impl Shared {
             rssi:            AtomicI8::new(RSSI_UNKNOWN),
             acl_in:          Channel::new(),
             acl_out:         Channel::new(),
+            acl_taken:       Signal::new(),
             changed:         Signal::new(),
             data_length:     Signal::new(),
             disconnect:      Signal::new(),
@@ -955,9 +967,10 @@ impl Shared {
     /// connection starts.
     #[inline]
     pub fn set_connected(&self, connected: bool) {
-        self.state.lock(|cell| {
+        let changed = self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if state.connected != connected {
+            let changed = state.connected != connected;
+            if changed {
                 state.epoch = state.epoch.wrapping_add(1);
                 state.ltk_pending = false;
                 state.remote_features = 0;
@@ -965,21 +978,30 @@ impl Shared {
                 state.active_queries = 0;
                 state.phys = [1, 1];
                 state.phy_pending = None;
+                // Per link (Core, Vol 4, Part E, 7.3.94): every link starts
+                // with the default.
+                state.payload_timeout = DEFAULT_PAYLOAD_TIMEOUT;
             }
             state.connected = connected;
             if connected {
                 state.legacy_enabled = false;
             }
+            changed
         });
-        if !connected {
-            while self.acl_out.try_receive().is_ok() {}
-            while self.acl_in.try_receive().is_ok() {}
+        if changed {
+            // Requests of the host for the link that ended, or for a link
+            // before this one.
             self.disconnect.reset();
             self.ltk.reset();
             self.param_request.reset();
             self.parameter_reply.reset();
             self.data_length.reset();
             self.rssi.store(RSSI_UNKNOWN, Ordering::Relaxed);
+        }
+        if !connected {
+            // Received data stays for the host, which the controller lets
+            // read it before the disconnection complete event.
+            while self.acl_out.try_receive().is_ok() {}
             self.wakeup.reset();
         }
     }
@@ -1240,16 +1262,27 @@ impl<'shared> Hci<'shared> {
         let Some(&[low, high, reason]) = params.first_chunk::<3>().filter(|_| params.len() == 3) else {
             return STATUS_INVALID_PARAMETERS;
         };
-        let connected = self.shared.state.lock(|state| state.borrow().connected);
-        if !connected || u16::from_le_bytes([low, high]) != CONNECTION_HANDLE {
-            return STATUS_UNKNOWN_CONNECTION;
-        }
         if !DISCONNECT_REASONS.contains(&reason) {
-            return STATUS_INVALID_PARAMETERS;
+            let connected = self.shared.state.lock(|state| state.borrow().connected);
+            return if !connected || u16::from_le_bytes([low, high]) != CONNECTION_HANDLE {
+                STATUS_UNKNOWN_CONNECTION
+            } else {
+                STATUS_INVALID_PARAMETERS
+            };
         }
-        self.shared.disconnect.signal(reason);
-        self.shared.wakeup.signal(());
-        STATUS_SUCCESS
+        // Signalled under the same lock as the check, so the request cannot
+        // outlive the link it was meant for.
+        let status = self.shared.state.lock(|state| {
+            if !state.borrow().connected || u16::from_le_bytes([low, high]) != CONNECTION_HANDLE {
+                return STATUS_UNKNOWN_CONNECTION;
+            }
+            self.shared.disconnect.signal(reason);
+            STATUS_SUCCESS
+        });
+        if status == STATUS_SUCCESS {
+            self.shared.wakeup.signal(());
+        }
+        status
     }
 
     /// Runs a command answered with a command complete. Returns the status
@@ -1343,28 +1376,41 @@ impl<'shared> Hci<'shared> {
         else {
             return STATUS_INVALID_PARAMETERS;
         };
-        let (connected, features, busy) = self.shared.state.lock(|cell| {
-            let state = cell.borrow();
-            (state.connected, state.remote_features, state.active_queries & QUERY_CONNECTION_UPDATE != 0)
-        });
-        if !connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
-            return STATUS_UNKNOWN_CONNECTION;
-        }
-        // One update at a time, as in Zephyr: a second request would replace
-        // the first, whose complete event the host then never gets.
-        if busy {
-            return STATUS_DISALLOWED;
-        }
-        if features & 0x02 == 0 {
-            return STATUS_UNSUPPORTED_REMOTE_FEATURE;
-        }
         let [min, max, latency, timeout] =
             [[min0, min1], [max0, max1], [latency0, latency1], [timeout0, timeout1]].map(u16::from_le_bytes);
-        if min > max || !valid_connection_parameters(max, latency, timeout, 1, 0) || min < 6 {
-            return STATUS_INVALID_PARAMETERS;
+        let valid = min <= max && min >= 6 && valid_connection_parameters(max, latency, timeout, 1, 0);
+        // Checked and signalled under one lock, so the request cannot outlive
+        // the link it was meant for.
+        let status = self.shared.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            if !state.connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+                return STATUS_UNKNOWN_CONNECTION;
+            }
+            if !valid {
+                return STATUS_INVALID_PARAMETERS;
+            }
+            // While the host answers a central's request, as TrouBLE's
+            // `ConnectionParamsRequest::accept` does with this command first,
+            // the central's procedure carries the parameters: nothing to do.
+            if state.active_queries & QUERY_REMOTE_PARAMETERS != 0 {
+                return STATUS_SUCCESS;
+            }
+            // One update at a time, as in Zephyr: a second request would
+            // replace the first, whose complete event the host then never
+            // gets.
+            if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
+                return STATUS_DISALLOWED;
+            }
+            if state.remote_features & 0x02 == 0 {
+                return STATUS_UNSUPPORTED_REMOTE_FEATURE;
+            }
+            state.active_queries |= QUERY_CONNECTION_UPDATE;
+            self.shared.param_request.signal([min, max, latency, timeout]);
+            STATUS_SUCCESS
+        });
+        if status != STATUS_SUCCESS {
+            return status;
         }
-        self.shared.state.lock(|cell| cell.borrow_mut().active_queries |= QUERY_CONNECTION_UPDATE);
-        self.shared.param_request.signal([min, max, latency, timeout]);
         self.shared.wakeup.signal(());
         STATUS_SUCCESS
     }
@@ -1470,13 +1516,17 @@ impl<'shared> Hci<'shared> {
                 let Some(value) = length(rest) else { return (STATUS_INVALID_PARAMETERS, 0) };
                 returned[0] = handle0;
                 returned[1] = handle1;
-                let connected = self.shared.state.lock(|cell| cell.borrow().connected);
-                if !connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
-                    return (STATUS_UNKNOWN_CONNECTION, 2);
+                let status = self.shared.state.lock(|cell| {
+                    if !cell.borrow().connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+                        return STATUS_UNKNOWN_CONNECTION;
+                    }
+                    self.shared.data_length.signal(value);
+                    STATUS_SUCCESS
+                });
+                if status == STATUS_SUCCESS {
+                    self.shared.wakeup.signal(());
                 }
-                self.shared.data_length.signal(value);
-                self.shared.wakeup.signal(());
-                (STATUS_SUCCESS, 2)
+                (status, 2)
             },
             0x2024 => {
                 let Some(value) = length(params) else { return (STATUS_INVALID_PARAMETERS, 0) };
@@ -1541,13 +1591,14 @@ impl<'shared> Hci<'shared> {
             } else if state.active_queries & QUERY_REMOTE_PARAMETERS == 0 {
                 STATUS_DISALLOWED
             } else {
-                // One answer per request.
+                // One answer per request, signalled under the lock that
+                // checked the link.
                 state.active_queries &= !QUERY_REMOTE_PARAMETERS;
+                self.shared.parameter_reply.signal(reply);
                 STATUS_SUCCESS
             }
         });
         if status == STATUS_SUCCESS {
-            self.shared.parameter_reply.signal(reply);
             self.shared.wakeup.signal(());
         }
         (status, 2)
@@ -1775,6 +1826,7 @@ impl Transport for Hci<'_> {
                 P::read_hci(packet.kind, &mut bytes, rx).map_err(TransportError::from)
             },
             Either::Second(acl) => {
+                self.shared.acl_taken.signal(());
                 let (buffer, len) = acl.to_hci();
                 let mut bytes = buffer.get(..len).unwrap_or_default();
                 P::read_hci(PacketKind::AclData, &mut bytes, rx).map_err(TransportError::from)
@@ -2204,17 +2256,41 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_drops_data_and_pending_secrets_from_the_previous_link() {
+    fn disconnect_drops_outgoing_data_and_requests_but_keeps_received_data() {
         let shared = Shared::new();
         shared.set_connected(true);
         assert!(shared.push_acl_in(Llid::Start, &[1, 2, 3]));
         assert!(shared.acl_out.try_send(AclOut { data: [0; ACL_MAX], epoch: 1, len: 1, llid: Llid::Start }).is_ok());
         shared.ltk.signal(Some([0xAA; 16]));
         shared.disconnect.signal(0x13);
+        shared.data_length.signal([251, 2120]);
+        shared.state.lock(|cell| cell.borrow_mut().payload_timeout = 100);
         shared.set_connected(false);
-        assert!(shared.acl_in.try_receive().is_err());
+        // Acknowledged data reaches the host before the disconnection.
+        assert!(shared.acl_in.try_receive().is_ok());
         assert!(shared.next_acl_out_if(true).is_none());
         assert!(shared.take_ltk().is_none());
         assert!(shared.take_disconnect().is_none());
+        assert!(shared.take_data_length().is_none());
+        assert_eq!(shared.state.lock(|cell| cell.borrow().payload_timeout), DEFAULT_PAYLOAD_TIMEOUT);
+        // A reset drops it.
+        assert!(shared.push_acl_in(Llid::Start, &[1]));
+        shared.complete_reset();
+        assert!(shared.acl_in.try_receive().is_err());
+    }
+
+    #[test]
+    fn a_connection_update_while_the_host_answers_a_central_request_is_part_of_the_answer() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let hci = Hci::new(&shared);
+        let update = [0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0];
+        // Before the feature exchange LE Connection Update is refused...
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_UNSUPPORTED_REMOTE_FEATURE);
+        // ...but not as TrouBLE's accept of a central's request.
+        shared.ask_parameters();
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
+        assert!(shared.take_param_request().is_none());
+        assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0]), STATUS_SUCCESS);
     }
 }

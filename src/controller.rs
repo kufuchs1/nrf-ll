@@ -124,7 +124,14 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
             shared.complete_reset();
             continue;
         }
-        if !connection.flush_after_disconnect(shared).await {
+        // The host gets the retained events and every packet the link
+        // acknowledged before it learns that the link ended.
+        if !connection.flush_after_disconnect(shared).await
+            || matches!(
+                select(shared.acl_in_drained(), shared.reset_requested()).await,
+                embassy_futures::select::Either::Second(())
+            )
+        {
             radio.disable();
             clock.pause();
             shared.complete_reset();

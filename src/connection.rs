@@ -304,15 +304,24 @@ enum Expect {
 /// in octets and its time on the air in microseconds, each way.
 #[derive(Clone, Copy)]
 struct DataLength {
+    /// What the central knows this side may send: the defaults until an
+    /// `LL_LENGTH_RSP` of ours was acknowledged or the central answered our
+    /// `LL_LENGTH_REQ`. Longer packets than announced are never sent.
+    announced_tx: [u16; 2],
     /// What the host lets this side send.
-    local_tx: [u16; 2],
+    local_tx:     [u16; 2],
+    /// What this side offered in its last `LL_LENGTH_REQ` or `LL_LENGTH_RSP`,
+    /// until the central took it.
+    offered_tx:   Option<[u16; 2]>,
     /// What the central receives, as it said.
-    peer_rx:  [u16; 2],
+    peer_rx:      [u16; 2],
     /// What the central sends, as it said.
-    peer_tx:  [u16; 2],
+    peer_tx:      [u16; 2],
     /// Effective values last reported to the host: transmit octets and
     /// time, receive octets and time.
-    reported: [u16; 4],
+    reported:     [u16; 4],
+    /// Whether the central answered our `LL_LENGTH_REQ` as unknown.
+    unsupported:  bool,
 }
 
 impl DataLength {
@@ -320,9 +329,11 @@ impl DataLength {
     fn effective(&self) -> [u16; 4] {
         let [default_octets, default_time] = LENGTH_DEFAULT;
         let [max_octets, max_time] = LENGTH_MAX;
+        // A host that lowers its length takes effect at once: shorter packets
+        // are always allowed.
         [
-            self.local_tx[0].min(self.peer_rx[0]),
-            self.local_tx[1].min(self.peer_rx[1]).max(default_time),
+            self.local_tx[0].min(self.announced_tx[0]).min(self.peer_rx[0]),
+            self.local_tx[1].min(self.announced_tx[1]).min(self.peer_rx[1]).max(default_time),
             max_octets.min(self.peer_tx[0]).max(default_octets),
             max_time.min(self.peer_tx[1]).max(default_time),
         ]
@@ -332,12 +343,30 @@ impl DataLength {
     /// side send.
     const fn new(local_tx: [u16; 2]) -> Self {
         let [octets, time] = LENGTH_DEFAULT;
-        Self { local_tx, peer_rx: LENGTH_DEFAULT, peer_tx: LENGTH_DEFAULT, reported: [octets, time, octets, time] }
+        Self {
+            announced_tx: LENGTH_DEFAULT,
+            local_tx,
+            offered_tx: None,
+            peer_rx: LENGTH_DEFAULT,
+            peer_tx: LENGTH_DEFAULT,
+            reported: [octets, time, octets, time],
+            unsupported: false,
+        }
+    }
+
+    /// Makes the values this side offered effective: the central answered
+    /// our request, or acknowledged our response.
+    const fn offer_taken(&mut self) {
+        if let Some(offered) = self.offered_tx.take() {
+            self.announced_tx = offered;
+        }
     }
 
     /// The payload of `LL_LENGTH_REQ` and `LL_LENGTH_RSP`: the longest
-    /// supported reception and what this side may send.
-    fn pdu(&self, code: u8) -> [u8; 9] {
+    /// supported reception and what this side may send, which becomes
+    /// effective once the central took it.
+    fn pdu(&mut self, code: u8) -> [u8; 9] {
+        self.offered_tx = Some(self.local_tx);
         let mut pdu = [code, 0, 0, 0, 0, 0, 0, 0, 0];
         let [max_octets, max_time] = LENGTH_MAX;
         let values = [max_octets, max_time, self.local_tx[0], self.local_tx[1]];
@@ -529,6 +558,9 @@ pub struct Connection {
     received:               bool,
     /// A central's connection parameter request waiting for an answer.
     remote_request:         Option<RemoteRequest>,
+    /// Deadline of the central's connection parameter request we answered,
+    /// until its `LL_CONNECTION_UPDATE_IND` or rejection.
+    remote_update:          Option<u32>,
     /// Time of the next statistics log.
     report_at:              u32,
     /// Counters and crystal restarts at the last statistics log.
@@ -585,6 +617,7 @@ impl Connection {
                         self.terminate = Some((reason, true));
                     }
                 },
+                TxKind::Control if self.tx.get(DATA_HEADER_LEN) == Some(&OP_LENGTH_RSP) => self.length.offer_taken(),
                 TxKind::AclPart | TxKind::Control | TxKind::Empty => {},
             }
             self.load_next(shared);
@@ -671,6 +704,7 @@ impl Connection {
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.tx_kind == TxKind::Empty
+            && self.acl.is_none()
             && self.queue.iter().all(Option::is_none)
             && self.terminate.is_none()
             && self.encryption.phase == Phase::Idle
@@ -1059,8 +1093,10 @@ impl Connection {
             OP_LENGTH_REQ | OP_LENGTH_RSP => {
                 self.length.take_peer(params);
                 if code == OP_LENGTH_REQ {
-                    self.enqueue(Llid::Control, &self.length.pdu(OP_LENGTH_RSP));
+                    let response = self.length.pdu(OP_LENGTH_RSP);
+                    self.enqueue(Llid::Control, &response);
                 } else {
+                    self.length.offer_taken();
                     self.length_request = Request::Done;
                 }
             },
@@ -1223,6 +1259,7 @@ impl Connection {
             queue: [None; QUEUE_LEN],
             pending: [None; RX_SLOTS],
             remote_request: None,
+            remote_update: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
@@ -1475,7 +1512,11 @@ impl Connection {
             }
             open = false;
         }
-        let ours_more = self.queue.iter().any(Option::is_some) || shared.has_acl_out();
+        // A host packet partly sent counts: its rest follows in fragments.
+        let ours_more = self.tx_kind == TxKind::AclPart
+            || self.acl.is_some()
+            || self.queue.iter().any(Option::is_some)
+            || shared.has_acl_out();
         if let Some(tx_header) = self.tx.first_mut() {
             let flags = if self.sn { SN } else { 0 }
                 | if self.nesn { NESN } else { 0 }

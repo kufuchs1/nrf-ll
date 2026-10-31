@@ -15,9 +15,13 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   control procedures a central starts. A host that enabled the LE remote connection parameter request event decides on
   the parameters a central asks for, with LE Remote Connection Parameter Request Reply or Negative Reply (TrouBLE's
   `connection-params-update` feature), and has them rejected if it does not answer in 30 s; otherwise the link layer
-  accepts any valid parameters. Every packet
+  accepts any valid parameters. Our own procedures wait until the central's update arrives, and an LE Connection
+  Update the host sends while it answers (as TrouBLE's `accept` does) is part of that answer. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
+- **Link end:** the host reads every packet the link acknowledged before it gets the disconnection complete event;
+  requests of the host for a link that ended cannot reach the next one, and every link starts with the default
+  authenticated payload timeout.
 - **Read RSSI** answers with the averaged signal strength of the central's packets.
 - **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the
   plain one. Keys the host gave, and the keys of a link, are overwritten once they are no longer needed.
@@ -31,8 +35,8 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
 - **Data length extension:** payloads of up to 251 octets each way instead of 27. The link layer receives 251 octets
   from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer packets once the host allows them for
   the link (LE Set Data Length, TrouBLE's `Connection::update_data_length`) or for new links (LE Write Suggested
-  Default Data Length), and then asks the central itself; the host learns the effective lengths from LE Data Length
-  Change. The host's ACL packets hold up to 251 octets and are sent in fragments as long as the central receives,
+  Default Data Length), and then asks the central itself; a longer length only takes effect once the central was told
+  and answered, or acknowledged our answer. The host learns the effective lengths from LE Data Length Change. The host's ACL packets hold up to 251 octets and are sent in fragments as long as the central receives,
   within its time on the air. The CCM runs in extended length mode and generates its key stream when it is armed, as
   in Zephyr, instead of at radio READY.
 - **LE 2M PHY** when the central supports it, which halves the airtime of every packet: the link layer asks for it once
@@ -72,7 +76,8 @@ The radio uses the fast ramp-up of 40 µs instead of 140 µs, which shortens eve
 100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs between two
 packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare enables the
 radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled
-in the NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5; leave them to it.
+in the NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5; leave them to it. TIMER0 and TIMER1 are
+shut down, not only stopped, between uses, which avoids the standby current of nRF52832 anomaly 78.
 
 The 32 MHz crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the time and
 restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside the link

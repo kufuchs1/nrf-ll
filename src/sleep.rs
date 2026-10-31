@@ -56,6 +56,10 @@ fn sleep<Ready>(mut ready: Ready)
 where
     Ready: FnMut() -> bool,
 {
+    // Pending events wake `WFE` only with SEVONPEND; set here as well, so a
+    // wait before the radio driver exists, such as an ECB block, cannot
+    // sleep forever.
+    enable();
     while !ready() {
         clear();
         if ready() {
