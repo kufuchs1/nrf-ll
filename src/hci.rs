@@ -49,9 +49,12 @@ const EVENT_PAYLOAD_TIMEOUT_EXPIRED: u8 = 0x57;
 const PAYLOAD_TIMEOUT_EVENT_BIT: u64 = 1 << 23;
 /// Authenticated payload timeout after a reset: 30 s in units of 10 ms.
 const DEFAULT_PAYLOAD_TIMEOUT: u16 = 3000;
-/// Lifetime of a resolvable private address: the default of LE Set
-/// Resolvable Private Address Timeout, 15 minutes.
+/// Lifetime of a resolvable private address after a reset: the default of
+/// LE Set Resolvable Private Address Timeout, 15 minutes.
 const PRIVATE_ADDRESS_TIMEOUT: Duration = Duration::from_secs(900);
+/// Longest lifetime of a resolvable private address the host can set, in
+/// seconds: one hour.
+const PRIVATE_ADDRESS_TIMEOUT_MAX: u16 = 0x0E10;
 /// Encryption key refresh complete event.
 const EVENT_KEY_REFRESH_COMPLETE: u8 = 0x30;
 /// Event code: command complete.
@@ -98,6 +101,12 @@ const STATUS_UNSUPPORTED_REMOTE_FEATURE: u8 = 0x1A;
 const ADV_INTERVAL_MIN: u16 = 0x0020;
 /// Largest advertising interval in units of 0.625 ms.
 const ADV_INTERVAL_MAX: u16 = 0x4000;
+
+/// Reasons the host may give for a disconnection (Core, Vol 4, Part E,
+/// 7.1.6): authentication failure, remote user terminated, low resources,
+/// power off, unsupported remote feature, unacceptable pairing with unit key
+/// and unacceptable connection parameters.
+const DISCONNECT_REASONS: [u8; 7] = [0x05, 0x13, 0x14, 0x15, 0x1A, 0x29, 0x3B];
 
 /// Commands answered with a command status event.
 const ASYNC_COMMANDS: [u16; 6] = [0x0406, 0x041D, 0x2013, 0x2016, 0x2019, 0x2032];
@@ -427,6 +436,8 @@ struct HostState {
     /// The last resolvable private address, the key it was made with and
     /// when it expires. Advertising keeps it until then.
     private_address:   Option<(Peer, [u8; 16], Instant)>,
+    /// Lifetime of a resolvable private address.
+    private_timeout:   Duration,
     /// First byte of the central's features, zero until known.
     remote_features:   u8,
 }
@@ -436,6 +447,24 @@ impl HostState {
     fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
         let (address, made_with, expires) = self.private_address?;
         (made_with == key && now < expires).then_some(address)
+    }
+
+    /// The state after power-on or a reset, for a link that is `connected`
+    /// in its generation `epoch`.
+    const fn new(connected: bool, epoch: u32) -> Self {
+        Self {
+            connected,
+            epoch,
+            event_mask_page_2: 0,
+            legacy: LegacySettings::new(),
+            legacy_enabled: false,
+            local_irk: None,
+            ltk_pending: false,
+            payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
+            private_address: None,
+            private_timeout: PRIVATE_ADDRESS_TIMEOUT,
+            remote_features: 0,
+        }
     }
 }
 
@@ -505,18 +534,7 @@ impl Shared {
             events:        Channel::new(),
             ltk:           Signal::new(),
             param_request: Signal::new(),
-            state:         Mutex::new(RefCell::new(HostState {
-                connected:         false,
-                epoch:             0,
-                event_mask_page_2: 0,
-                legacy:            LegacySettings::new(),
-                legacy_enabled:    false,
-                local_irk:         None,
-                ltk_pending:       false,
-                payload_timeout:   DEFAULT_PAYLOAD_TIMEOUT,
-                private_address:   None,
-                remote_features:   0,
-            })),
+            state:         Mutex::new(RefCell::new(HostState::new(false, 0))),
             wakeup:        Signal::new(),
         }
     }
@@ -537,6 +555,33 @@ impl Shared {
             }
             None
         })
+    }
+
+    /// Gets a stable private address without holding interrupts off during
+    /// RNG and AES. Both the HCI task and the link layer may call it: the
+    /// link layer can only preempt the HCI task, and whichever address is
+    /// cached last is the one advertising moves to at its next event.
+    fn own_address(&self, override_key: Option<[u8; 16]>) -> Peer {
+        let (configured_key, fallback, lifetime) = self.state.lock(|cell| {
+            let state = cell.borrow();
+            (
+                override_key.or(state.local_irk).filter(|_| state.legacy.private),
+                state.legacy.address,
+                state.private_timeout,
+            )
+        });
+        let Some(key) = configured_key else { return fallback };
+        let now = Instant::now();
+        if let Some(address) = self.state.lock(|cell| cell.borrow().cached_address(key, now)) {
+            return address;
+        }
+        let mut prand = [0; 3];
+        random(&mut prand);
+        let address = Peer::new(crypto::resolvable_address(key, prand), true);
+        self.state.lock(|cell| {
+            cell.borrow_mut().private_address = Some((address, key, now.saturating_add(lifetime)));
+        });
+        address
     }
 
     /// The authenticated payload timeout in microseconds, and whether the
@@ -561,6 +606,29 @@ impl Shared {
     /// Queues an event for the host, waiting for room.
     #[inline]
     pub async fn push_event(&self, packet: Packet) { self.events.send(packet).await; }
+
+    /// Moves running advertising to a new resolvable private address once
+    /// the current one expired, so a device that advertises for long cannot
+    /// be followed by its address. Call it before each advertising event,
+    /// outside radio events.
+    #[inline]
+    pub fn refresh_private_address(&self) {
+        let private = self.state.lock(|cell| {
+            let state = cell.borrow();
+            state.legacy_enabled && state.legacy.private && state.local_irk.is_some()
+        });
+        if !private {
+            return;
+        }
+        let address = self.own_address(None);
+        self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            if state.legacy_enabled && state.legacy.private && state.legacy.own != address {
+                state.legacy.own = address;
+                info!("new private address");
+            }
+        });
+    }
 
     /// Queues a key request and authorizes one corresponding host reply.
     #[inline]
@@ -661,7 +729,7 @@ impl<'shared> Hci<'shared> {
     /// and the length of the return parameters written to `returned`.
     fn advertising_command(&self, opcode: u16, params: &[u8], returned: &mut [u8; 8]) -> (u8, usize) {
         // Prepare entropy and AES outside the shared-state critical section.
-        let own = (opcode == 0x200A && params == [1]).then(|| self.own_address(None));
+        let own = (opcode == 0x200A && params == [1]).then(|| self.shared.own_address(None));
         let (status, len, enable) = self.shared.state.lock(|cell| {
             let mut state = cell.borrow_mut();
             let connected = state.connected;
@@ -723,6 +791,9 @@ impl<'shared> Hci<'shared> {
         if !connected || u16::from_le_bytes([low, high]) != CONNECTION_HANDLE {
             return STATUS_UNKNOWN_CONNECTION;
         }
+        if !DISCONNECT_REASONS.contains(&reason) {
+            return STATUS_INVALID_PARAMETERS;
+        }
         self.shared.disconnect.signal(reason);
         self.shared.wakeup.signal(());
         STATUS_SUCCESS
@@ -734,14 +805,18 @@ impl<'shared> Hci<'shared> {
         match opcode {
             // Peer addresses in the resolving list are resolved whenever it
             // holds their key, so enabling resolution changes nothing.
-            0x0C01 | 0x0C31 | 0x0C33 | 0x2001 | 0x202D | 0x202E | 0x204E => (STATUS_SUCCESS, 0),
+            0x0C01 | 0x0C31 | 0x0C33 | 0x2001 | 0x202D | 0x204E => (STATUS_SUCCESS, 0),
+            0x202E => (self.private_timeout_command(params), 0),
             0x0C63 | 0x0C7B | 0x0C7C => self.payload_timeout_command(opcode, params, returned),
             0x2027..=0x2029 => (self.resolving_command(opcode, params), 0),
             0x0C03 => {
+                // Everything the host configured goes, the keys of the
+                // resolving list included; the link itself is kept.
                 self.shared.state.lock(|cell| {
                     let mut state = cell.borrow_mut();
-                    state.legacy = LegacySettings::new();
-                    state.legacy_enabled = false;
+                    let (connected, epoch, ltk_pending, remote_features) =
+                        (state.connected, state.epoch, state.ltk_pending, state.remote_features);
+                    *state = HostState { ltk_pending, remote_features, ..HostState::new(connected, epoch) };
                 });
                 self.shared.changed.signal(());
                 (STATUS_SUCCESS, 0)
@@ -834,29 +909,6 @@ impl<'shared> Hci<'shared> {
     #[must_use = "the interface is only created"]
     pub const fn new(shared: &'shared Shared) -> Self { Self { shared } }
 
-    /// Gets a stable private address without holding interrupts off during RNG.
-    ///
-    /// Only the HCI task changes keys/cache; the radio executor may update
-    /// connection state between these short register-independent snapshots.
-    fn own_address(&self, override_key: Option<[u8; 16]>) -> Peer {
-        let (configured_key, fallback) = self.shared.state.lock(|cell| {
-            let state = cell.borrow();
-            (override_key.or(state.local_irk).filter(|_| state.legacy.private), state.legacy.address)
-        });
-        let Some(key) = configured_key else { return fallback };
-        let now = Instant::now();
-        if let Some(address) = self.shared.state.lock(|cell| cell.borrow().cached_address(key, now)) {
-            return address;
-        }
-        let mut prand = [0; 3];
-        random(&mut prand);
-        let address = Peer::new(crypto::resolvable_address(key, prand), true);
-        self.shared.state.lock(|cell| {
-            cell.borrow_mut().private_address = Some((address, key, now.saturating_add(PRIVATE_ADDRESS_TIMEOUT)));
-        });
-        address
-    }
-
     /// Runs an authenticated payload timeout command: the event mask page 2
     /// that enables its expiry event (0x0C63), reading (0x0C7B) and writing
     /// (0x0C7C) the timeout. Returns the status and the length of the return
@@ -896,6 +948,20 @@ impl<'shared> Hci<'shared> {
         (STATUS_SUCCESS, len)
     }
 
+    /// Sets the lifetime of resolvable private addresses (LE Set Resolvable
+    /// Private Address Timeout). The current address keeps its expiry.
+    fn private_timeout_command(&self, params: &[u8]) -> u8 {
+        let Some(&bytes) = params.first_chunk::<2>().filter(|_| params.len() == 2) else {
+            return STATUS_INVALID_PARAMETERS;
+        };
+        let seconds = u16::from_le_bytes(bytes);
+        if !(1..=PRIVATE_ADDRESS_TIMEOUT_MAX).contains(&seconds) {
+            return STATUS_INVALID_PARAMETERS;
+        }
+        self.shared.state.lock(|cell| cell.borrow_mut().private_timeout = Duration::from_secs(u64::from(seconds)));
+        STATUS_SUCCESS
+    }
+
     /// Runs a resolving list command: add (0x2027), remove (0x2028) or clear
     /// (0x2029). Returns the status.
     fn resolving_command(&self, opcode: u16, params: &[u8]) -> u8 {
@@ -917,7 +983,7 @@ impl<'shared> Hci<'shared> {
                         let state = cell.borrow();
                         state.legacy_enabled && state.legacy.private && state.legacy.own == state.legacy.address
                     });
-                let own = needs_address.then(|| self.own_address(Some(*local)));
+                let own = needs_address.then(|| self.shared.own_address(Some(*local)));
                 let added = self.shared.state.lock(|cell| {
                     let mut state = cell.borrow_mut();
                     if *local != [0; 16] {
@@ -1205,8 +1271,49 @@ mod tests {
         assert_eq!(hci.command_async(0x0406, &[0, 0]), STATUS_INVALID_PARAMETERS);
         assert_eq!(hci.command_async(0x0406, &[1, 0, 0x13]), STATUS_UNKNOWN_CONNECTION);
         assert!(shared.take_disconnect().is_none());
+        assert_eq!(hci.command_async(0x0406, &[0, 0, 0x16]), STATUS_INVALID_PARAMETERS);
+        assert!(shared.take_disconnect().is_none());
         assert_eq!(hci.command_async(0x0406, &[0, 0, 0x13]), STATUS_SUCCESS);
         assert_eq!(shared.take_disconnect(), Some(0x13));
+    }
+
+    #[test]
+    fn reset_forgets_keys_and_settings_but_keeps_the_link() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        let mut add = [0_u8; 39];
+        add[0] = 1;
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 0xC6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+        assert_eq!(hci.command_sync(0x2027, &add, &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(hci.command_sync(0x0C7C, &[0, 0, 100, 0], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(hci.command_sync(0x202E, &[60, 0], &mut returned).0, STATUS_SUCCESS);
+        let epoch = shared.state.lock(|cell| cell.borrow().epoch);
+        assert_eq!(hci.command_sync(0x0C03, &[], &mut returned).0, STATUS_SUCCESS);
+        shared.state.lock(|cell| {
+            let state = cell.borrow();
+            assert!(state.local_irk.is_none());
+            assert!(state.legacy.resolving.is_empty());
+            assert_eq!(state.payload_timeout, DEFAULT_PAYLOAD_TIMEOUT);
+            assert_eq!(state.private_timeout, PRIVATE_ADDRESS_TIMEOUT);
+            assert!(state.connected);
+            assert_eq!(state.epoch, epoch);
+        });
+    }
+
+    #[test]
+    fn the_private_address_timeout_is_checked_and_kept() {
+        let shared = Shared::new();
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        for params in [&[0, 0][..], &[0x11, 0x0E][..], &[60][..]] {
+            assert_eq!(hci.command_sync(0x202E, params, &mut returned).0, STATUS_INVALID_PARAMETERS);
+        }
+        assert_eq!(hci.command_sync(0x202E, &[0x10, 0x0E], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.state.lock(|cell| cell.borrow().private_timeout), Duration::from_secs(3600));
     }
 
     #[test]

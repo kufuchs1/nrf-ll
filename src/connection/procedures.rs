@@ -48,8 +48,9 @@ use crate::{
 const ACCEPTABLE_DBM: i32 = -70;
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
-/// Error code: controller busy, another procedure with an instant runs.
-const ERROR_BUSY: u8 = 0x3A;
+/// Error code: different transaction collision, another procedure with an
+/// instant runs.
+const ERROR_DIFFERENT_TRANSACTION: u8 = 0x2A;
 /// Offset field of a connection parameter request without a preference.
 const NO_OFFSET: [u8; 2] = [0xFF, 0xFF];
 
@@ -136,7 +137,7 @@ impl Connection {
     pub(super) fn handle_parameters(&mut self, code: u8, params: &[u8]) {
         match code {
             OP_CONNECTION_UPDATE_IND => {
-                let Some(update) = parse_update(params) else {
+                let Some(mut update) = parse_update(params) else {
                     self.abort = Some(ERROR_INVALID_PARAMETERS);
                     return;
                 };
@@ -147,7 +148,7 @@ impl Connection {
                 } else {
                     // The update answers a request of the host; the host
                     // learns the outcome at the instant.
-                    self.param_request = None;
+                    update.requested = self.param_request.take().is_some();
                     self.param_update = Some(update);
                 }
             },
@@ -159,7 +160,11 @@ impl Connection {
                         ERROR_INVALID_PARAMETERS,
                     ]);
                 } else if self.param_update.is_some() || self.phy_update.is_some() || self.channel_update.is_some() {
-                    self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, ERROR_BUSY]);
+                    self.enqueue(Llid::Control, &[
+                        OP_REJECT_EXT_IND,
+                        OP_CONNECTION_PARAM_REQ,
+                        ERROR_DIFFERENT_TRANSACTION,
+                    ]);
                 } else {
                     // Any parameters the central proposes suit the device.
                     let mut response = [0_u8; 24];
@@ -204,8 +209,12 @@ impl Connection {
             self.abort = Some(ERROR_INSTANT_PASSED);
         } else if self.phy_update.is_some() {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
-        } else {
+        } else if phy != self.phy {
             self.phy_update = Some((phy, instant));
+        } else {
+            // The PHY stays: nothing changes at the instant, and the host,
+            // which did not ask, learns nothing (Core, Vol 4, Part E,
+            // 7.7.65.12).
         }
     }
 

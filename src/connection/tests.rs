@@ -42,7 +42,7 @@ fn keepalive_packets_cannot_extend_a_local_disconnect_deadline() {
 fn first_valid_packet_replaces_the_short_establishment_deadline() {
     let mut link = connection();
     let deadline = link.establishment_deadline.unwrap();
-    assert!(matches!(link.ended(deadline), Some(Ended::Lost)));
+    assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH))));
     assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 1000, &Shared::new()), Some(true));
     assert!(link.establishment_deadline.is_none());
     assert!(link.ended(deadline).is_none());
@@ -249,6 +249,8 @@ fn channel_map_instants_are_checked_across_counter_wrap() {
     assert!(!future_instant(4, 0xFFFE));
     assert!(!future_instant(4, 4));
     assert!(!future_instant(0, 0x8000));
+    assert!(!future_instant(0, 0x7FFF));
+    assert!(future_instant(0, 0x7FFE));
     let mut link = connection();
     link.counter = 5;
     link.handle_control(&[OP_CHANNEL_MAP_IND, 3, 0, 0, 0, 0, 4, 0], false);
@@ -541,4 +543,88 @@ fn the_peripheral_pings_before_the_authenticated_payload_timeout() {
     link.queue = [None; QUEUE_LEN];
     link.start_procedures(53_200_000, &shared);
     assert_eq!(link.payload_timer, Some((53_200_000, false)));
+}
+
+#[test]
+fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
+    let phases = [
+        Phase::AwaitingKey { requested: true, rand: [0; 8], ediv: [0; 2] },
+        Phase::Starting,
+        Phase::AwaitingStartResponse,
+        Phase::Pausing,
+        Phase::AwaitingPauseResponse,
+        Phase::Paused,
+    ];
+    for phase in phases {
+        for llid in [Llid::Start, Llid::Continuation] {
+            let mut link = connection();
+            link.encryption.phase = phase;
+            assert_eq!(link.receive(llid.bits(), 5, true, 999, &Shared::new()), None);
+            assert_eq!(link.abort, Some(ERROR_MIC_FAILURE));
+            assert!(!link.nesn && !link.received);
+        }
+        // Empty PDUs and control PDUs keep the procedure going.
+        let mut link = connection();
+        link.encryption.phase = phase;
+        assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 999, &Shared::new()), Some(true));
+        let mut link = connection();
+        link.encryption.phase = phase;
+        assert_eq!(link.receive(Llid::Control.bits(), 1, true, 999, &Shared::new()), Some(true));
+        assert_eq!(link.abort, None);
+    }
+}
+
+#[test]
+fn a_parameter_request_during_another_instant_is_a_transaction_collision() {
+    let mut link = encrypted();
+    link.phy_update = Some((Phy::M2, 10));
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    assert_eq!(
+        link.queue[0].map(|queued| queued.data[..3] == [OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, 0x2A]),
+        Some(true)
+    );
+}
+
+/// A connection update PDU to `interval` with the current latency and
+/// timeout at instant 10.
+fn update_to(interval: u8) -> [u8; 12] { [OP_CONNECTION_UPDATE_IND, 1, 0, 0, interval, 0, 0, 0, 0x58, 2, 10, 0] }
+
+/// Applies the update due at instant 10 and returns how many events the
+/// host got.
+fn events_at_instant(link: &mut Connection) -> usize {
+    let shared = Shared::new();
+    link.counter = 10;
+    link.apply_instants(&shared);
+    let mut count = 0;
+    while shared.try_push_event(Packet::completed_packets(1)) {
+        count += 1;
+    }
+    4 - count
+}
+
+#[test]
+fn the_host_learns_of_updates_that_change_something_or_that_it_asked_for() {
+    let mut link = encrypted();
+    link.handle_control(&update_to(24), true);
+    assert_eq!(link.abort, None);
+    assert_eq!(events_at_instant(&mut link), 1);
+    assert_eq!(link.interval, 24 * UNIT_1250_US);
+    // The same parameters again: only the anchor moves.
+    let mut link = encrypted();
+    link.handle_control(&update_to(12), true);
+    assert_eq!(events_at_instant(&mut link), 0);
+    // Unless they answer the host's request.
+    let mut link = encrypted();
+    link.param_request = Some(1000);
+    link.handle_control(&update_to(12), true);
+    assert!(link.param_request.is_none());
+    assert_eq!(events_at_instant(&mut link), 1);
+}
+
+#[test]
+fn a_phy_update_to_the_current_phy_changes_nothing() {
+    let mut link = encrypted();
+    link.handle_control(&[OP_PHY_UPDATE_IND, 1, 1, 10, 0], true);
+    assert_eq!(link.abort, None);
+    assert!(link.phy_update.is_none());
 }

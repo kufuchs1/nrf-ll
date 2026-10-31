@@ -158,6 +158,10 @@ impl ResolvingList {
             .map(|&(identity, _)| identity)
     }
 
+    /// Whether no peer is listed.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool { self.entries.iter().all(Option::is_none) }
+
     /// An empty list.
     #[inline]
     #[must_use = "the list is only created"]
@@ -219,7 +223,9 @@ impl Settings {
     /// resolvable private address counts as the identity it resolves to.
     fn accepts_connection(&self, central: Peer) -> bool {
         if self.kind.is_directed() {
-            return central == self.peer;
+            // A central with privacy answers from a resolvable private
+            // address of the identity the advertising is directed to.
+            return central == self.peer || self.resolving.identity(central) == Some(self.peer);
         }
         self.kind.is_connectable()
             && (self.filter_policy & 0x02 == 0

@@ -42,6 +42,9 @@ const ERROR_PDU_NOT_ALLOWED: u8 = 0x24;
 const ERROR_INSTANT_PASSED: u8 = 0x28;
 /// Error code: unsupported link layer parameter value.
 const ERROR_UNSUPPORTED_VALUE: u8 = 0x20;
+/// Error code: connection failed to be established, no packet from the
+/// central within six connection events.
+const ERROR_FAILED_TO_ESTABLISH: u8 = 0x3E;
 /// Maximum time allowed for an encryption procedure.
 const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 /// Supported link layer features.
@@ -293,6 +296,9 @@ struct Update {
     latency:    u16,
     /// New parameters in link layer units.
     params:     ConnectionParams,
+    /// Whether the update answers a request of the host, which then learns
+    /// of it even without a change.
+    requested:  bool,
     /// New supervision timeout in microseconds.
     timeout:    u32,
     /// Transmit window offset in microseconds.
@@ -427,11 +433,17 @@ impl Connection {
                 start: old_anchor.wrapping_sub(self.phy.address_offset_us()).wrapping_add(update.win_offset),
                 size:  update.win_size,
             };
+            let changed =
+                self.interval != update.interval || self.latency != update.latency || self.timeout != update.timeout;
             self.interval = update.interval;
             self.latency = update.latency;
             self.timeout = update.timeout;
             self.param_update = None;
-            _ = shared.try_push_event(Packet::connection_update_complete(0, update.params));
+            // The host learns of updates that change something or that it
+            // asked for (Core, Vol 6, Part B, 5.1.1).
+            if changed || update.requested {
+                _ = shared.try_push_event(Packet::connection_update_complete(STATUS_SUCCESS, update.params));
+            }
             info!("connection interval now {} us", update.interval);
         }
     }
@@ -503,9 +515,10 @@ impl Connection {
         if let Some(reason) = self.terminated {
             return Some(Ended::Terminated(reason));
         }
-        if self.establishment_deadline.is_some_and(|deadline| reached(now, deadline))
-            || reached(now, self.last_valid.wrapping_add(self.timeout))
-        {
+        if self.establishment_deadline.is_some_and(|deadline| reached(now, deadline)) {
+            return Some(Ended::Error(ERROR_FAILED_TO_ESTABLISH));
+        }
+        if reached(now, self.last_valid.wrapping_add(self.timeout)) {
             return Some(Ended::Lost);
         }
         None
@@ -898,6 +911,14 @@ impl Connection {
             self.abort = Some(ERROR_MIC_FAILURE);
             return None;
         }
+        // Once the central asked to start or pause encryption, it sends no
+        // data until encryption runs again (Core, Vol 6, Part B, 5.1.3). Data
+        // now could be plain text injected into a link the host trusts as
+        // encrypted: end the link before acknowledging it.
+        if llid != Llid::Control.bits() && len != 0 && self.encryption.phase != Phase::Idle {
+            self.abort = Some(ERROR_MIC_FAILURE);
+            return None;
+        }
         if self.encryption.rx_on && len != 0 && self.payload_timer.is_some() {
             self.payload_timer = Some((address, false));
         }
@@ -1178,6 +1199,7 @@ fn parse_update(bytes: &[u8]) -> Option<Update> {
         interval: u32::from(u16::from_le_bytes([interval0, interval1])).saturating_mul(UNIT_1250_US),
         latency: params.latency,
         params,
+        requested: false,
         timeout: u32::from(u16::from_le_bytes([timeout0, timeout1])).saturating_mul(UNIT_10MS_US),
         win_offset: u32::from(u16::from_le_bytes([offset0, offset1])).saturating_mul(UNIT_1250_US),
         win_size: u32::from(win_size).saturating_mul(UNIT_1250_US),
@@ -1187,10 +1209,12 @@ fn parse_update(bytes: &[u8]) -> Option<Update> {
 /// Transmit power in dBm of power control level `level`.
 fn tx_power(level: usize) -> i8 { LEVELS_DBM.get(level).copied().unwrap_or_default() }
 
-/// An instant must be in the next half of the wrapping event counter.
+/// Whether an instant is still ahead of the current event: the event at it
+/// is running already, and the specification counts a distance of 32767 or
+/// more as passed.
 const fn future_instant(now: u16, instant: u16) -> bool {
     let distance = instant.wrapping_sub(now);
-    distance != 0 && distance < 0x8000
+    distance != 0 && distance < 0x7FFF
 }
 
 /// Exact parameter lengths of the control PDUs this controller understands.

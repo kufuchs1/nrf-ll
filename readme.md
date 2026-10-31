@@ -8,8 +8,9 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
 
 - **Advertising:** legacy advertising on the LE 1M PHY: all five advertising types, scan responses, the advertising
   channel map and the filter accept list. Resolvable private addresses from the identity resolving key the host puts
-  into the resolving list, renewed every 15 minutes and at every start; peer addresses in the resolving list are
-  resolved for the filter accept list.
+  into the resolving list, renewed when they expire after 15 minutes, or the timeout the host sets, also while
+  advertising keeps running; peer addresses in the resolving list are resolved for the filter accept list and for
+  directed advertising. A reset forgets every key the host gave.
 - **Connections:** as peripheral, with channel selection algorithm 1 or 2, as the central chooses. It answers the LL
   control procedures a central starts and accepts any valid connection parameters a central asks for.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
