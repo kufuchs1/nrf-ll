@@ -34,6 +34,7 @@ fn clear() {
     interrupt::RNG.unpend();
     interrupt::RTC0.unpend();
     interrupt::TIMER0.unpend();
+    interrupt::TIMER1.unpend();
 }
 
 /// Lets pending interrupts wake `WFE`. Interrupts that are enabled in the

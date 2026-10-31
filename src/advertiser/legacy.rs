@@ -409,7 +409,7 @@ fn on_channel(
     // SAFETY: `rx` is a full packet buffer borrowed for this event; every
     // path out waits until the radio is disabled.
     let () = unsafe { radio.set_buffer(rx.as_mut_ptr()) };
-    radio.wait_disabled();
+    radio.wait_switched();
     radio.set_turnaround(Turnaround::Transmit);
     radio.clear_address();
     let deadline = clock.end_time().wrapping_add(LISTEN_US);
@@ -430,13 +430,13 @@ fn on_channel(
         // SAFETY: the radio only reads the scan response, borrowed for this
         // event, and is disabled before it returns.
         let () = unsafe { radio.set_buffer(scan_response.as_bytes().as_ptr().cast_mut()) };
-        radio.wait_disabled();
+        radio.wait_switched();
         radio.set_turnaround(Turnaround::None);
         radio.wait_end();
         radio.wait_disabled();
         return None;
     }
-    radio.wait_disabled();
+    // The switch would answer the packet: it is stopped before.
     radio.disable();
     if !valid {
         return None;
