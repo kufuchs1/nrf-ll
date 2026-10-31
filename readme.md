@@ -12,7 +12,10 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   advertising keeps running; peer addresses in the resolving list are resolved for the filter accept list and for
   directed advertising. A reset forgets every key the host gave.
 - **Connections:** as peripheral, with channel selection algorithm 1 or 2, as the central chooses. It answers the LL
-  control procedures a central starts and accepts any valid connection parameters a central asks for. Every packet
+  control procedures a central starts. A host that enabled the LE remote connection parameter request event decides on
+  the parameters a central asks for, with LE Remote Connection Parameter Request Reply or Negative Reply (TrouBLE's
+  `connection-params-update` feature), and has them rejected if it does not answer in 30 s; otherwise the link layer
+  accepts any valid parameters. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
 - **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the

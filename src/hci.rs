@@ -82,11 +82,16 @@ const LE_CONNECTION_COMPLETE: u8 = 0x01;
 const LE_CONNECTION_UPDATE_COMPLETE: u8 = 0x03;
 /// LE subevent: long term key request.
 const LE_LTK_REQUEST: u8 = 0x05;
+/// LE subevent: remote connection parameter request.
+const LE_REMOTE_PARAMETER_REQUEST: u8 = 0x06;
 
 /// Status: success.
 const STATUS_SUCCESS: u8 = 0x00;
 /// Bit of an accepted LE Connection Update awaiting its complete event.
 const QUERY_CONNECTION_UPDATE: u8 = 0x08;
+/// Bit of a central's connection parameter request awaiting the host's
+/// reply.
+const QUERY_REMOTE_PARAMETERS: u8 = 0x10;
 /// Status: unknown command.
 const STATUS_UNKNOWN_COMMAND: u8 = 0x01;
 /// Status: unknown connection identifier.
@@ -466,6 +471,22 @@ impl Packet {
         Self::build(PacketKind::Event, &[EVENT_LE_META, 12, 4, status, 0, 0], &features)
     }
 
+    /// An LE remote connection parameter request event: the interval range,
+    /// latency and supervision timeout the central asks for.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn remote_parameter_request([min, max, latency, timeout]: [u16; 4]) -> Self {
+        let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
+        let mut bytes =
+            [EVENT_LE_META, 11, LE_REMOTE_PARAMETER_REQUEST, handle_low, handle_high, 0, 0, 0, 0, 0, 0, 0, 0];
+        for (target, source) in
+            bytes.iter_mut().skip(5).zip([min, max, latency, timeout].iter().flat_map(|value| value.to_le_bytes()))
+        {
+            *target = source;
+        }
+        Self::build(PacketKind::Event, &bytes, &[])
+    }
+
     /// Completion of the host's remote version query.
     #[inline]
     #[must_use = "the packet is only built"]
@@ -602,29 +623,32 @@ impl HostState {
 /// State shared between the host interface and the link layer.
 pub struct Shared {
     /// ACL data received from the air.
-    acl_in:        Channel<CriticalSectionRawMutex, Packet, 2>,
+    acl_in:          Channel<CriticalSectionRawMutex, Packet, 2>,
     /// ACL data from the host for the air.
-    acl_out:       Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
+    acl_out:         Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
     /// Advertising settings changed.
-    changed:       Signal<CriticalSectionRawMutex, ()>,
+    changed:         Signal<CriticalSectionRawMutex, ()>,
     /// Disconnection requested by the host, with the reason.
-    disconnect:    Signal<CriticalSectionRawMutex, u8>,
+    disconnect:      Signal<CriticalSectionRawMutex, u8>,
     /// Events for the host.
-    events:        Channel<CriticalSectionRawMutex, Packet, 4>,
+    events:          Channel<CriticalSectionRawMutex, Packet, 4>,
     /// Long term key from the host, `None` if it has none.
-    ltk:           Signal<CriticalSectionRawMutex, Option<[u8; 16]>>,
+    ltk:             Signal<CriticalSectionRawMutex, Option<[u8; 16]>>,
     /// Connection parameters the host asks the central for: interval range,
     /// latency and supervision timeout in link layer units.
-    param_request: Signal<CriticalSectionRawMutex, [u16; 4]>,
+    param_request:   Signal<CriticalSectionRawMutex, [u16; 4]>,
+    /// The host's answer to a central's connection parameter request: the
+    /// parameters to offer, or the reason to reject it.
+    parameter_reply: Signal<CriticalSectionRawMutex, Result<[u16; 4], u8>>,
     /// ACL data received from the air for the host.
     /// Reset handshake with the radio executor.
-    reset:         Signal<CriticalSectionRawMutex, ()>,
+    reset:           Signal<CriticalSectionRawMutex, ()>,
     /// Radio reset completion.
-    reset_done:    Signal<CriticalSectionRawMutex, ()>,
+    reset_done:      Signal<CriticalSectionRawMutex, ()>,
     /// Host state.
-    state:         Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
+    state:           Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
     /// Something for the connection arrived from the host.
-    wakeup:        Signal<CriticalSectionRawMutex, ()>,
+    wakeup:          Signal<CriticalSectionRawMutex, ()>,
 }
 
 impl Default for Shared {
@@ -649,6 +673,14 @@ impl Shared {
         })
     }
 
+    /// Passes a central's connection parameter request to the host, which
+    /// answers with LE Remote Connection Parameter Request Reply or Negative
+    /// Reply.
+    pub(crate) fn ask_parameters(&self) {
+        self.parameter_reply.reset();
+        self.state.lock(|cell| cell.borrow_mut().active_queries |= QUERY_REMOTE_PARAMETERS);
+    }
+
     /// Waits until the advertising settings change.
     #[inline]
     pub async fn changed(&self) { self.changed.wait().await; }
@@ -668,6 +700,10 @@ impl Shared {
         self.reset_done.signal(());
     }
 
+    /// Ends a central's connection parameter request the host was asked
+    /// about, answered or not.
+    pub(crate) fn end_parameter_request(&self) { self.complete_query(QUERY_REMOTE_PARAMETERS); }
+
     /// Lets the host start another connection update once the current one
     /// reported its outcome.
     pub(crate) fn finish_param_request(&self) { self.complete_query(QUERY_CONNECTION_UPDATE); }
@@ -682,22 +718,30 @@ impl Shared {
     #[must_use = "the capacity is only read"]
     pub fn has_room(&self) -> bool { self.acl_in.free_capacity() != 0 }
 
+    /// Whether the host decides on a central's connection parameter
+    /// requests: it enabled the LE remote connection parameter request
+    /// event, as Zephyr decides. Otherwise the link layer accepts them.
+    pub(crate) fn host_decides_parameters(&self) -> bool {
+        self.state.lock(|cell| cell.borrow().allows(EVENT_LE_META, LE_REMOTE_PARAMETER_REQUEST))
+    }
+
     /// Creates the shared state.
     #[inline]
     #[must_use = "the state is only created"]
     pub const fn new() -> Self {
         Self {
-            reset:         Signal::new(),
-            reset_done:    Signal::new(),
-            acl_in:        Channel::new(),
-            acl_out:       Channel::new(),
-            changed:       Signal::new(),
-            disconnect:    Signal::new(),
-            events:        Channel::new(),
-            ltk:           Signal::new(),
-            param_request: Signal::new(),
-            state:         Mutex::new(RefCell::new(HostState::new(false, 0))),
-            wakeup:        Signal::new(),
+            reset:           Signal::new(),
+            reset_done:      Signal::new(),
+            acl_in:          Channel::new(),
+            acl_out:         Channel::new(),
+            changed:         Signal::new(),
+            disconnect:      Signal::new(),
+            events:          Channel::new(),
+            ltk:             Signal::new(),
+            param_request:   Signal::new(),
+            parameter_reply: Signal::new(),
+            state:           Mutex::new(RefCell::new(HostState::new(false, 0))),
+            wakeup:          Signal::new(),
         }
     }
 
@@ -860,6 +904,7 @@ impl Shared {
             self.disconnect.reset();
             self.ltk.reset();
             self.param_request.reset();
+            self.parameter_reply.reset();
             self.wakeup.reset();
         }
     }
@@ -891,6 +936,12 @@ impl Shared {
         });
     }
 
+    /// Takes the next ACL packet for the host, as its bytes.
+    #[cfg(test)]
+    pub(crate) fn take_acl_in(&self) -> Option<[u8; PACKET_MAX]> {
+        self.acl_in.try_receive().ok().map(|packet| packet.bytes)
+    }
+
     /// Takes a pending disconnection request.
     #[inline]
     pub fn take_disconnect(&self) -> Option<u8> { self.disconnect.try_take() }
@@ -902,6 +953,9 @@ impl Shared {
     /// Takes connection parameters the host asks the central for.
     #[inline]
     pub fn take_param_request(&self) -> Option<[u16; 4]> { self.param_request.try_take() }
+
+    /// Takes the host's answer to a central's connection parameter request.
+    pub(crate) fn take_parameter_reply(&self) -> Option<Result<[u16; 4], u8>> { self.parameter_reply.try_take() }
 
     /// Takes a host-requested transmit and receive PHY preference.
     pub(crate) fn take_phy_request(&self) -> Option<[u8; 2]> {
@@ -924,12 +978,6 @@ impl Shared {
     /// Waits until the host passes something to the connection.
     #[inline]
     pub async fn wakeup(&self) { self.wakeup.wait().await; }
-
-    /// Takes the next ACL packet for the host, as its bytes.
-    #[cfg(test)]
-    pub(crate) fn take_acl_in(&self) -> Option<[u8; PACKET_MAX]> {
-        self.acl_in.try_receive().ok().map(|packet| packet.bytes)
-    }
 
     /// Shared state whose host enabled every event, as TrouBLE enables all
     /// the events this controller sends.
@@ -1014,6 +1062,7 @@ impl<'shared> Hci<'shared> {
                 (27, 0xA7),
                 (28, 0x0E),
                 (32, 0x30),
+                (33, 0x30),
                 (34, 0x38),
                 (35, 0x76),
                 (39, 0x04),
@@ -1135,6 +1184,7 @@ impl<'shared> Hci<'shared> {
             },
             0x0C33 => (if params.len() == 7 { STATUS_SUCCESS } else { STATUS_INVALID_PARAMETERS }, 0),
             0x202D | 0x204E => (self.privacy_command(opcode, params), 0),
+            0x2020 | 0x2021 => self.parameter_reply_command(opcode, params, returned),
             0x0C01 | 0x0C63 | 0x2001 => (self.event_mask_command(opcode, params), 0),
             0x202E => (self.private_timeout_command(params), 0),
             0x0C7B | 0x0C7C => self.payload_timeout_command(opcode, params, returned),
@@ -1300,6 +1350,51 @@ impl<'shared> Hci<'shared> {
     #[must_use = "the interface is only created"]
     pub const fn new(shared: &'shared Shared) -> Self { Self { shared } }
 
+    /// Takes the host's answer to a central's connection parameter request:
+    /// LE Remote Connection Parameter Request Reply (0x2020) with the
+    /// parameters to offer, or Negative Reply (0x2021) with the reason.
+    /// Returns the status and the handle.
+    fn parameter_reply_command(&self, opcode: u16, params: &[u8], returned: &mut [u8; 8]) -> (u8, usize) {
+        let Some(&[handle0, handle1]) = params.first_chunk::<2>() else { return (STATUS_INVALID_PARAMETERS, 0) };
+        let reply = if opcode == 0x2020 {
+            let Some(&[_, _, min0, min1, max0, max1, latency0, latency1, timeout0, timeout1, _, _, _, _]) =
+                params.first_chunk::<14>().filter(|_| params.len() == 14)
+            else {
+                return (STATUS_INVALID_PARAMETERS, 0);
+            };
+            let [min, max, latency, timeout] =
+                [[min0, min1], [max0, max1], [latency0, latency1], [timeout0, timeout1]].map(u16::from_le_bytes);
+            if min > max || min < 6 || !valid_connection_parameters(max, latency, timeout, 1, 0) {
+                return (STATUS_INVALID_PARAMETERS, 0);
+            }
+            Ok([min, max, latency, timeout])
+        } else {
+            let Some(&[_, _, reason]) = params.first_chunk::<3>().filter(|_| params.len() == 3) else {
+                return (STATUS_INVALID_PARAMETERS, 0);
+            };
+            Err(reason)
+        };
+        returned[0] = handle0;
+        returned[1] = handle1;
+        let status = self.shared.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            if !state.connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+                STATUS_UNKNOWN_CONNECTION
+            } else if state.active_queries & QUERY_REMOTE_PARAMETERS == 0 {
+                STATUS_DISALLOWED
+            } else {
+                // One answer per request.
+                state.active_queries &= !QUERY_REMOTE_PARAMETERS;
+                STATUS_SUCCESS
+            }
+        });
+        if status == STATUS_SUCCESS {
+            self.shared.parameter_reply.signal(reply);
+            self.shared.wakeup.signal(());
+        }
+        (status, 2)
+    }
+
     /// Runs an authenticated payload timeout command: reading (0x0C7B) and
     /// writing (0x0C7C) the timeout. Returns the status and the length of
     /// the return parameters.
@@ -1378,6 +1473,13 @@ impl<'shared> Hci<'shared> {
         }
         self.shared.state.lock(|cell| cell.borrow_mut().private_timeout = Duration::from_secs(u64::from(seconds)));
         STATUS_SUCCESS
+    }
+
+    /// Runs LE Remote Connection Parameter Request Reply or Negative Reply.
+    /// Returns the status.
+    #[cfg(test)]
+    pub(crate) fn reply_parameters(&self, opcode: u16, params: &[u8]) -> u8 {
+        self.parameter_reply_command(opcode, params, &mut [0; 8]).0
     }
 
     /// Runs a resolving list command: add (0x2027), remove (0x2028) or clear

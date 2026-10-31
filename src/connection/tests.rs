@@ -496,6 +496,9 @@ fn a_central_parameter_request_is_accepted_or_rejected_when_invalid() {
     let mut link = encrypted();
     link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
     assert_eq!(link.abort, None);
+    // A host that did not enable the request event leaves it to the link
+    // layer.
+    link.drive_remote_request(0, &Shared::new());
     let response = link.queue[0].unwrap();
     assert_eq!(usize::from(response.len), 24);
     assert_eq!(response.data[0], OP_CONNECTION_PARAM_RSP);
@@ -1044,4 +1047,40 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     link.phy = Phy::M1;
     // Interval, widening, address, ramp-up, margin and processing time.
     assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 40 - 30 - 500);
+}
+
+#[test]
+fn a_host_that_enabled_the_event_decides_on_a_central_parameter_request() {
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let mut link = encrypted();
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    assert!(link.queue[0].is_none());
+    assert!(link.notifications.iter().all(Option::is_none));
+    let hci = crate::hci::Hci::new(&shared);
+    // The host offers 30 to 40 units, latency 2 and timeout 800.
+    let reply = [0, 0, 30, 0, 40, 0, 2, 0, 0x20, 0x03, 0, 0, 0, 0];
+    assert_eq!(hci.reply_parameters(0x2020, &reply), 0);
+    assert_eq!(hci.reply_parameters(0x2021, &[0, 0, 0x3B]), 0x0C);
+    link.drive_remote_request(1000, &shared);
+    let response = link.queue[0].unwrap();
+    assert_eq!(response.data[..9], [OP_CONNECTION_PARAM_RSP, 30, 0, 40, 0, 2, 0, 0x20, 0x03]);
+    assert_eq!(response.data[9..24], parameter_request(OP_CONNECTION_PARAM_REQ)[9..]);
+    assert!(link.remote_request.is_none());
+}
+
+#[test]
+fn a_host_that_does_not_answer_has_the_request_rejected() {
+    let shared = Shared::with_all_events();
+    let mut link = encrypted();
+    link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
+    link.drive_remote_request(0, &shared);
+    link.drive_remote_request(HOST_REPLY_US - 1, &shared);
+    assert!(link.queue[0].is_none());
+    link.drive_remote_request(HOST_REPLY_US, &shared);
+    assert_eq!(
+        link.queue[0].map(|queued| queued.data[..3] == [OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, 0x3B]),
+        Some(true)
+    );
 }

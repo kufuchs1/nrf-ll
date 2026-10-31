@@ -7,9 +7,11 @@ use super::{
     ERROR_INVALID_PARAMETERS,
     ERROR_PDU_NOT_ALLOWED,
     ERROR_RESPONSE_TIMEOUT,
+    ERROR_UNACCEPTABLE_PARAMETERS,
     ERROR_UNSUPPORTED_FEATURE,
     ERROR_UNSUPPORTED_VALUE,
     FEATURES,
+    HOST_REPLY_US,
     OP_CONNECTION_PARAM_REQ,
     OP_CONNECTION_PARAM_RSP,
     OP_CONNECTION_UPDATE_IND,
@@ -26,6 +28,7 @@ use super::{
     OP_UNKNOWN_RSP,
     PROCEDURE_TIMEOUT_US,
     Phase,
+    RemoteRequest,
     Request,
     STATUS_SUCCESS,
     UNIT_10MS_US,
@@ -118,6 +121,60 @@ impl Connection {
         )
     }
 
+    /// Asks the host about a central's connection parameter request and
+    /// answers the central as the host decides: with its parameters and the
+    /// central's offsets, or with a rejection. A host that does not answer
+    /// in [`HOST_REPLY_US`] has the request rejected. Without a host that
+    /// decides, the link layer accepts any valid request.
+    pub(super) fn drive_remote_request(&mut self, now: u32, shared: &Shared) {
+        let Some(request) = self.remote_request else { return };
+        if request.asked.is_none() && !shared.host_decides_parameters() {
+            // Any parameters the central proposes suit the device.
+            self.remote_request = None;
+            let mut response = [0_u8; 24];
+            for (target, source) in
+                response.iter_mut().zip(core::iter::once(&OP_CONNECTION_PARAM_RSP).chain(&request.params))
+            {
+                *target = *source;
+            }
+            self.enqueue(Llid::Control, &response);
+            return;
+        }
+        let Some(deadline) = request.asked else {
+            let field = |index: usize| {
+                let bytes = request.params.get(index..index.saturating_add(2)).unwrap_or_default();
+                bytes.first_chunk::<2>().map_or(0, |&pair| u16::from_le_bytes(pair))
+            };
+            self.notify(Packet::remote_parameter_request([field(0), field(2), field(4), field(6)]), shared);
+            shared.ask_parameters();
+            self.remote_request = Some(RemoteRequest { asked: Some(now.wrapping_add(HOST_REPLY_US)), ..request });
+            return;
+        };
+        let reply = match shared.take_parameter_reply() {
+            Some(reply) => reply,
+            None if reached(now, deadline) => {
+                shared.end_parameter_request();
+                Err(ERROR_UNACCEPTABLE_PARAMETERS)
+            },
+            None => return,
+        };
+        self.remote_request = None;
+        match reply {
+            Ok(values) => {
+                let mut response = [0_u8; 24];
+                let host = values.iter().flat_map(|value| value.to_le_bytes());
+                let offsets = request.params.iter().skip(8).copied();
+                for (target, source) in
+                    response.iter_mut().zip(core::iter::once(OP_CONNECTION_PARAM_RSP).chain(host).chain(offsets))
+                {
+                    *target = source;
+                }
+                self.enqueue(Llid::Control, &response);
+            },
+            Err(reason) => self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, reason]),
+        }
+    }
+
     /// Answers the feature exchange of the central, and takes its answer to
     /// ours. The first byte holds the features both sides use.
     pub(super) fn handle_features(&mut self, code: u8, params: &[u8]) {
@@ -184,15 +241,12 @@ impl Connection {
                         OP_CONNECTION_PARAM_REQ,
                         ERROR_DIFFERENT_TRANSACTION,
                     ]);
+                } else if let Some(&request) = params.first_chunk::<23>() {
+                    // Answered before the next event, by the host if it
+                    // decides on such requests.
+                    self.remote_request = Some(RemoteRequest { asked: None, params: request });
                 } else {
-                    // Any parameters the central proposes suit the device.
-                    let mut response = [0_u8; 24];
-                    for (target, source) in
-                        response.iter_mut().zip(core::iter::once(&OP_CONNECTION_PARAM_RSP).chain(params))
-                    {
-                        *target = *source;
-                    }
-                    self.enqueue(Llid::Control, &response);
+                    // Too short: `valid_request` let it through.
                 }
             },
             _ => {},
@@ -363,7 +417,8 @@ impl Connection {
             && self.phy_update.is_none()
             && self.channel_update.is_none()
             && self.queue.iter().all(Option::is_none)
-            && self.notifications.iter().all(Option::is_none);
+            && self.notifications.iter().all(Option::is_none)
+            && self.remote_request.is_none();
         let ours_running =
             [self.features_request, self.phy_request].iter().any(|request| matches!(request, Request::Requested(_)))
                 || self.param_request.is_some();

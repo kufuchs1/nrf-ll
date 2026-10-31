@@ -50,6 +50,11 @@ const ERROR_UNSUPPORTED_VALUE: u8 = 0x20;
 /// Error code: connection failed to be established, no packet from the
 /// central within six connection events.
 const ERROR_FAILED_TO_ESTABLISH: u8 = 0x3E;
+/// Error: unacceptable connection parameters.
+const ERROR_UNACCEPTABLE_PARAMETERS: u8 = 0x3B;
+/// Time the host gets to answer a central's connection parameter request,
+/// well within the central's procedure timeout.
+const HOST_REPLY_US: u32 = 30_000_000;
 /// Maximum time allowed for an encryption procedure.
 const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 /// Supported link layer features.
@@ -293,6 +298,15 @@ enum Expect {
     },
 }
 
+/// A central's connection parameter request waiting for an answer.
+#[derive(Clone, Copy)]
+struct RemoteRequest {
+    /// Whether the host was asked, and until when it may answer.
+    asked:  Option<u32>,
+    /// The request's parameters, whose offsets the response repeats.
+    params: [u8; 23],
+}
+
 /// A received PDU in plain text, waiting to be processed.
 #[derive(Clone, Copy)]
 struct Pending {
@@ -438,6 +452,8 @@ pub struct Connection {
     queue:                  [Option<Queued>; QUEUE_LEN],
     /// Whether the received PDU is new and has to be processed.
     received:               bool,
+    /// A central's connection parameter request waiting for an answer.
+    remote_request:         Option<RemoteRequest>,
     /// Time of the next statistics log.
     report_at:              u32,
     /// Counters and crystal restarts at the last statistics log.
@@ -649,6 +665,7 @@ impl Connection {
     /// Services host traffic before the next radio event.
     fn drive_host(&mut self, now: u32, shared: &Shared, entropy: &Prefetch) {
         self.drive_encryption(shared, entropy);
+        self.drive_remote_request(now, shared);
         self.service_queries(now, shared);
         self.start_procedures(now, shared);
     }
@@ -1121,6 +1138,7 @@ impl Connection {
             reported: (Stats::default(), 0),
             queue: [None; QUEUE_LEN],
             pending: [None; RX_SLOTS],
+            remote_request: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
             sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
