@@ -1,0 +1,68 @@
+[package]
+name = "nrf-ll"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bluetooth LE link layer for the nRF52832, as an HCI controller for TrouBLE"
+readme = "readme.md"
+
+[features]
+defmt = ["dep:defmt", "bt-hci/defmt", "embassy-time/defmt"]
+
+[dependencies]
+bt-hci = { version = "0", default-features = false }
+cortex-m = "0"
+defmt = { version = "1", optional = true }
+embassy-futures = "0"
+embassy-nrf = { version = "0", features = ["nrf52832", "unstable-pac"] }
+embassy-sync = "0"
+embassy-time = "0"
+embedded-io = "0"
+
+[dev-dependencies]
+aes = "0"
+# The RTC time driver only provides the time symbols for the host tests; no
+# test starts it.
+embassy-nrf = { version = "0", features = ["nrf52832", "time", "time-driver-rtc1", "unstable-pac"] }
+embassy-time = { version = "0", features = ["tick-hz-32_768"] }
+
+[target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+
+[lib]
+test = true
+bench = false
+
+# Embassy from its main branch, for the firmware and for TrouBLE alike.
+[patch.crates-io]
+embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 1 }
+pedantic = { level = "deny", priority = 1 }
+restriction = { level = "deny", priority = 1 }
+nursery = { level = "deny", priority = 1 }
+blanket_clippy_restriction_lints = { level = "allow", priority = 2 }
+big_endian_bytes = { level = "allow", priority = 2 }
+future_not_send = { level = "allow", priority = 2 }
+implicit_return = { level = "allow", priority = 2 }
+little_endian_bytes = { level = "allow", priority = 2 }
+separated_literal_suffix = { level = "allow", priority = 2 }
+single_call_fn = { level = "allow", priority = 2 }
+self_named_module_files = { level = "allow", priority = 2 }
+pub_with_shorthand = { level = "allow", priority = 2 }
+pub_use = { level = "allow", priority = 2 }
+# Result/Option propagation is intentional; it keeps driver error paths explicit.
+question_mark_used = { level = "allow", priority = 2 }
+# Raised inside the defmt macro expansion, only for some log formats.
+missing_asserts_for_indexing = { level = "allow", priority = 2 }
+

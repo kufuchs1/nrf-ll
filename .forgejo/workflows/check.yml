@@ -1,0 +1,26 @@
+# .forgejo/workflows/check.yml
+name: nrf-ll
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: fedora-44
+    timeout-minutes: 30
+    container:
+      image: docker.io/library/rust:1
+    steps:
+      - name: system packages (node for JS actions)
+        run: apt-get -qq update && apt-get -qqy install --no-install-recommends nodejs
+      - name: checkout
+        uses: https://code.forgejo.org/actions/checkout@v7
+      - name: fmt
+        run: cargo fmt --check
+      - name: host tests
+        run: cargo test --locked
+      - name: lints
+        run: |
+          cargo clippy --locked --target thumbv7em-none-eabihf
+          cargo clippy --locked --target thumbv7em-none-eabihf --features defmt
