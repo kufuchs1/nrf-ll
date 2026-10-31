@@ -8,7 +8,10 @@
 //! a radio event that aborted it is not delayed.
 
 use crate::radio::Phy;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::{
+    hint::black_box,
+    sync::atomic::{Ordering, compiler_fence},
+};
 use embassy_nrf::pac::{
     CCM,
     ECB,
@@ -149,7 +152,9 @@ pub fn encrypt_block(key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
     // An abort only happens during a radio event, which is over once the
     // link layer interrupt that the lock held back has run.
     while !ECB_LOCK.lock(|&()| ecb(&mut data)) {}
-    data.last_chunk::<16>().copied().unwrap_or_default()
+    let result = data.last_chunk::<16>().copied().unwrap_or_default();
+    wipe(&mut data);
+    result
 }
 
 /// Runs one ECB operation on `data`: key, cleartext, ciphertext. Returns
@@ -174,10 +179,10 @@ where
     for (target, source) in data.iter_mut().zip(ltk.iter().rev().chain(skd.iter().rev())) {
         *target = *source;
     }
-    if !encrypt(&mut data) {
-        return None;
-    }
-    data.get(32..)?.first_chunk::<16>().copied()
+    let completed = encrypt(&mut data);
+    let key = data.last_chunk::<16>().copied().filter(|_| completed);
+    wipe(&mut data);
+    key
 }
 
 /// Sets the packet counter of a configuration.
@@ -202,6 +207,26 @@ fn set_pointers(config: &[u8; CONFIG_LEN], input: *const u8, output: *mut u8, sc
     CCM.inptr().write_value(u32::try_from(input.addr()).unwrap_or_default());
     CCM.outptr().write_value(u32::try_from(output.addr()).unwrap_or_default());
     CCM.scratchptr().write_value(u32::try_from(scratch.as_mut_ptr().addr()).unwrap_or_default());
+}
+
+/// Stops a decryption the radio started, for a packet that is not used.
+#[inline]
+pub fn stop() {
+    CCM.tasks_stop().write_value(1);
+    CCM.events_endcrypt().write_value(0);
+    CCM.events_error().write_value(0);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Overwrites key material with zeros once it is no longer needed, so it
+/// does not outlive its use in RAM.
+#[inline]
+pub fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    // Keeps the compiler from dropping the stores to memory that is about
+    // to be released.
+    black_box(bytes);
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// Waits for the decryption of the received packet and returns whether its

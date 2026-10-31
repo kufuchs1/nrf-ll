@@ -247,6 +247,18 @@ struct Encryption {
     tx_sealed:  bool,
 }
 
+impl Encryption {
+    /// Forgets the keys, the IVs and the session key diversifier of the
+    /// link.
+    fn wipe(&mut self) {
+        crypto::wipe(&mut self.iv);
+        crypto::wipe(&mut self.rx_config);
+        crypto::wipe(&mut self.scratch);
+        crypto::wipe(&mut self.skd);
+        crypto::wipe(&mut self.tx_config);
+    }
+}
+
 /// Where the next packet from the central is expected.
 #[derive(Clone, Copy)]
 enum Expect {
@@ -471,13 +483,16 @@ impl Connection {
             return;
         }
         match shared.take_ltk() {
-            Some(Some(ltk)) => {
-                let Some(key) = crypto::session_key(ltk, self.encryption.skd) else {
+            Some(Some(mut ltk)) => {
+                let session = crypto::session_key(ltk, self.encryption.skd);
+                crypto::wipe(&mut ltk);
+                let Some(mut key) = session else {
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
                     return;
                 };
                 self.encryption.rx_config = crypto::config(key, self.encryption.iv, true);
                 self.encryption.tx_config = crypto::config(key, self.encryption.iv, false);
+                crypto::wipe(&mut key);
                 self.encryption.rx_counter = 0;
                 self.encryption.tx_counter = 0;
                 crypto::enable();
@@ -540,7 +555,8 @@ impl Connection {
     }
 
     /// Receives the central's packet of this event and answers it. Returns
-    /// its access address time.
+    /// its access address time, which sets the anchor even for a packet with
+    /// a CRC error or a retransmission (Core, Vol 6, Part B, 4.5.5).
     fn exchange(
         &mut self,
         radio: &mut Radio<'_>,
@@ -577,17 +593,17 @@ impl Connection {
         clock.cancel_start();
         let address = clock.address_time();
         radio.wait_end();
-        let Some(valid) = self.respond(radio, rx, address, shared) else {
+        if self.respond(radio, rx, address, shared).is_none() {
             radio.disable();
             crypto::disarm();
             return None;
-        };
+        }
         radio.wait_disabled();
         radio.set_turnaround(Turnaround::None);
         radio.wait_end();
         radio.wait_disabled();
         crypto::disarm();
-        valid.then_some(address)
+        Some(address)
     }
 
     /// Access address time expected at the current event from the last
@@ -601,21 +617,32 @@ impl Connection {
     #[expect(clippy::rest_pattern_accessible_field, reason = "the phase is matched by variant only")]
     fn handle_control(&mut self, payload: &[u8], encrypted: bool) {
         let Some((&code, params)) = payload.split_first() else { return };
-        if control_len(code).is_some_and(|len| params.len() != len) {
-            self.abort = Some(ERROR_INVALID_PARAMETERS);
-            return;
-        }
         // While encryption starts or pauses, the central may only take the
         // procedure on or end the link (Core, Vol 6, Part B, 5.1.3). Any
         // other answer would be queued in front of the next step.
-        let allowed = match self.encryption.phase {
-            Phase::Starting | Phase::AwaitingStartResponse => matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND),
-            Phase::Pausing | Phase::AwaitingPauseResponse => matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND),
-            Phase::Paused => matches!(code, OP_ENC_REQ | OP_TERMINATE_IND),
-            Phase::AwaitingKey { .. } | Phase::Idle => true,
+        let (allowed, can_answer) = match self.encryption.phase {
+            Phase::Starting | Phase::AwaitingStartResponse => {
+                (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
+            },
+            Phase::Pausing | Phase::AwaitingPauseResponse => {
+                (matches!(code, OP_PAUSE_ENC_RSP | OP_TERMINATE_IND), false)
+            },
+            Phase::Paused => (matches!(code, OP_ENC_REQ | OP_TERMINATE_IND), false),
+            Phase::AwaitingKey { .. } | Phase::Idle => (true, true),
         };
         if !allowed {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
+            return;
+        }
+        if control_len(code).is_some_and(|len| params.len() != len) {
+            // A PDU of the wrong length counts as one this side does not
+            // know, as in other controllers, unless an answer would get
+            // in the way of a running encryption procedure.
+            if can_answer {
+                self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, code]);
+            } else {
+                self.abort = Some(ERROR_INVALID_PARAMETERS);
+            }
             return;
         }
         match code {
@@ -905,6 +932,9 @@ impl Connection {
             return None;
         }
         if (header & SN != 0) != self.nesn {
+            // A retransmission proves the central is there, but its
+            // acknowledgement is not authenticated: take nothing else.
+            self.last_valid = address;
             return Some(false);
         }
         if self.encryption.rx_on && len != 0 && (usize::from(len) <= MIC_LEN || !mic_ok) {
@@ -975,27 +1005,33 @@ impl Connection {
     }
 
     /// Acknowledges the received packet and selects and seals the answer.
-    /// Runs within the interframe space.
-    fn respond(&mut self, radio: &mut Radio<'_>, rx: &[u8; BUFFER_LEN], address: u32, shared: &Shared) -> Option<bool> {
-        if !radio.crc_ok() {
-            self.stats.crc_errors = self.stats.crc_errors.wrapping_add(1);
-            return None;
-        }
-        let header = rx.first().copied().unwrap_or_default();
-        let len = rx.get(1).copied().unwrap_or_default();
-        let mic_ok = if self.encryption.rx_on && len != 0 {
-            let Some(valid) = crypto::wait_decrypted() else {
-                self.abort = Some(ERROR_HARDWARE_FAILURE);
-                return None;
+    /// Runs within the interframe space. A packet with a CRC error is
+    /// answered too, with the unacknowledged packet again (Core, Vol 6,
+    /// Part B, 4.5.6). Returns `None` if no answer may be sent.
+    fn respond(&mut self, radio: &mut Radio<'_>, rx: &[u8; BUFFER_LEN], address: u32, shared: &Shared) -> Option<()> {
+        if radio.crc_ok() {
+            let header = rx.first().copied().unwrap_or_default();
+            let len = rx.get(1).copied().unwrap_or_default();
+            let mic_ok = if self.encryption.rx_on && len != 0 {
+                let Some(valid) = crypto::wait_decrypted() else {
+                    self.abort = Some(ERROR_HARDWARE_FAILURE);
+                    return None;
+                };
+                valid
+            } else {
+                true
             };
-            valid
+            if let Some(rssi) = radio.rssi() {
+                self.power.on_packet(rssi);
+            }
+            self.receive(header, len, mic_ok, address, shared)?;
         } else {
-            true
-        };
-        if let Some(rssi) = radio.rssi() {
-            self.power.on_packet(rssi);
+            self.stats.crc_errors = self.stats.crc_errors.wrapping_add(1);
+            // Its length may be corrupt: the decryption is not waited for.
+            if self.encryption.rx_on {
+                crypto::stop();
+            }
         }
-        let valid = self.receive(header, len, mic_ok, address, shared)?;
         if let Some(tx_header) = self.tx.first_mut() {
             let flags = if self.sn { SN } else { 0 } | if self.nesn { NESN } else { 0 };
             *tx_header = (*tx_header & LLID_MASK) | flags;
@@ -1012,7 +1048,7 @@ impl Connection {
             crypto::disarm();
             radio.set_buffer(self.tx.as_mut_ptr());
         }
-        Some(valid)
+        Some(())
     }
 
     /// Runs connection events until the connection ends, exchanging data and
@@ -1116,6 +1152,10 @@ impl Connection {
             self.counter = self.counter.wrapping_add(1);
         };
         crypto::disable();
+        self.encryption.wipe();
+        crypto::wipe(&mut self.rx_plain);
+        crypto::wipe(&mut self.tx);
+        crypto::wipe(&mut self.tx_sealed);
         radio.set_s1_included(false);
         radio.set_tx_power(tx_power(DEFAULT_LEVEL));
         radio.set_phy(Phy::M1);

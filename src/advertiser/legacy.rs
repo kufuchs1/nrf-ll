@@ -141,9 +141,21 @@ impl ResolvingList {
         true
     }
 
-    /// Removes every peer.
+    /// Removes every peer, overwriting their keys.
     #[inline]
-    pub const fn clear(&mut self) { self.entries = [None; RESOLVING_LIST_SIZE]; }
+    pub fn clear(&mut self) {
+        for slot in &mut self.entries {
+            Self::forget(slot);
+        }
+    }
+
+    /// Overwrites the key in `slot` and empties it.
+    fn forget(slot: &mut Option<(Peer, [u8; 16])>) {
+        if let Some(&mut (_, ref mut irk)) = slot.as_mut() {
+            crypto::wipe(irk);
+        }
+        *slot = None;
+    }
 
     /// The identity address of `address`: the identity whose key generated
     /// it, if it is a resolvable private address of a listed peer.
@@ -172,7 +184,7 @@ impl ResolvingList {
     pub fn remove(&mut self, identity: Peer) {
         for slot in &mut self.entries {
             if slot.is_some_and(|(listed, _)| listed == identity) {
-                *slot = None;
+                Self::forget(slot);
             }
         }
     }
@@ -233,10 +245,16 @@ impl Settings {
                 || self.resolving.identity(central).is_some_and(|identity| self.filter.contains(identity)))
     }
 
-    /// Whether a scanner gets a scan response.
+    /// Whether a scanner gets a scan response. With the filter accept list,
+    /// a resolvable private address counts as the identity it resolves to.
+    /// This runs within the interframe space: resolving takes one AES block
+    /// of about 7 us per listed peer, and only for an address of the
+    /// resolvable type that is not listed itself.
     fn accepts_scan(&self, scanner: Peer) -> bool {
         matches!(self.kind, Kind::ConnectableUndirected | Kind::Scannable)
-            && (self.filter_policy & 0x01 == 0 || self.filter.contains(scanner))
+            && (self.filter_policy & 0x01 == 0
+                || self.filter.contains(scanner)
+                || self.resolving.identity(scanner).is_some_and(|identity| self.filter.contains(identity)))
     }
 
     /// The defaults after a reset.

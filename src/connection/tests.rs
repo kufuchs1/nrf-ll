@@ -152,7 +152,8 @@ fn every_unverified_nonempty_header_and_length_preserves_sequence_state() {
             assert_ne!(result, Some(true), "header={header:#x}, len={len}");
             assert!(!link.sn && !link.nesn && !link.received);
             assert_eq!(link.completed, 0);
-            assert_eq!(link.last_valid, 100);
+            // Only a retransmission keeps the link alive.
+            assert_eq!(link.last_valid, if result == Some(false) { 999 } else { 100 });
             assert_eq!(link.encryption.rx_counter, 0);
         }
     }
@@ -168,7 +169,9 @@ fn retransmission_does_not_consume_nonce_or_unverified_ack() {
     assert_eq!(link.abort, None);
     assert!(!link.sn && link.nesn && !link.received);
     assert_eq!(link.completed, 0);
-    assert_eq!(link.last_valid, 100);
+    // It shows the central is there, which keeps the link alive.
+    assert_eq!(link.last_valid, 999);
+    assert!(link.payload_timer.is_none());
     assert_eq!(link.encryption.rx_counter, 0);
 }
 
@@ -232,11 +235,20 @@ fn tx_counter_exhaustion_cannot_wrap() {
 
 #[test]
 fn controls_require_exact_lengths_and_valid_parameters() {
+    // A wrong length is answered as an unknown PDU.
     for payload in [&[OP_START_ENC_RSP, 0][..], &[OP_CHANNEL_MAP_IND, 1][..], &[OP_ENC_REQ][..]] {
         let mut link = connection();
         link.handle_control(payload, false);
-        assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
+        assert_eq!(link.abort, None);
+        assert_eq!(link.queue[0].map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, payload[0]]), Some(true));
+        assert!(link.channel_update.is_none() && link.encryption.phase == Phase::Idle);
     }
+    // Unless an encryption procedure runs, which an answer would block.
+    let mut link = connection();
+    link.encryption.phase = Phase::Starting;
+    link.handle_control(&[OP_START_ENC_RSP, 0], false);
+    assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
+    assert!(link.queue.iter().all(Option::is_none));
     let mut link = connection();
     link.handle_control(&[OP_CHANNEL_MAP_IND, 0, 0, 0, 0, 0, 6, 0], false);
     assert_eq!(link.abort, Some(ERROR_INVALID_PARAMETERS));
@@ -592,7 +604,7 @@ fn update_to(interval: u8) -> [u8; 12] { [OP_CONNECTION_UPDATE_IND, 1, 0, 0, int
 /// Applies the update due at instant 10 and returns how many events the
 /// host got.
 fn events_at_instant(link: &mut Connection) -> usize {
-    let shared = Shared::new();
+    let shared = Shared::with_all_events();
     link.counter = 10;
     link.apply_instants(&shared);
     let mut count = 0;
@@ -627,4 +639,33 @@ fn a_phy_update_to_the_current_phy_changes_nothing() {
     link.handle_control(&[OP_PHY_UPDATE_IND, 1, 1, 10, 0], true);
     assert_eq!(link.abort, None);
     assert!(link.phy_update.is_none());
+}
+
+#[test]
+fn the_host_parameter_request_goes_out_on_a_link_that_is_never_encrypted() {
+    let shared = Shared::new();
+    let mut link = connection();
+    link.central_features = Some([0x1F, 0, 0, 0, 0, 0, 0, 0]);
+    shared.request_params([24, 40, 0, 600]);
+    link.start_procedures(0, &shared);
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_CONNECTION_PARAM_REQ));
+    assert!(link.param_request.is_some());
+    // Features and the PHY still wait for encryption.
+    assert!(link.features_request == Request::NotStarted && link.phy_request == Request::NotStarted);
+}
+
+#[test]
+fn a_finished_link_leaves_no_key_material_behind() {
+    let mut link = encrypted();
+    link.encryption.rx_config = [0xA5; CONFIG_LEN];
+    link.encryption.tx_config = [0x5A; CONFIG_LEN];
+    link.encryption.skd = [1; 16];
+    link.encryption.iv = [2; 8];
+    link.encryption.scratch = [3; SCRATCH_LEN];
+    link.encryption.wipe();
+    assert_eq!(link.encryption.rx_config, [0; CONFIG_LEN]);
+    assert_eq!(link.encryption.tx_config, [0; CONFIG_LEN]);
+    assert_eq!(link.encryption.skd, [0; 16]);
+    assert_eq!(link.encryption.iv, [0; 8]);
+    assert!(link.encryption.scratch.iter().all(|&byte| byte == 0));
 }

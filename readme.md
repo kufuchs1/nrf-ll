@@ -12,7 +12,11 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   advertising keeps running; peer addresses in the resolving list are resolved for the filter accept list and for
   directed advertising. A reset forgets every key the host gave.
 - **Connections:** as peripheral, with channel selection algorithm 1 or 2, as the central chooses. It answers the LL
-  control procedures a central starts and accepts any valid connection parameters a central asks for.
+  control procedures a central starts and accepts any valid connection parameters a central asks for. Every packet
+  from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
+  is answered as unknown.
+- **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the
+  plain one. Keys the host gave, and the keys of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
@@ -21,7 +25,8 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   the link is encrypted and answers the central's own request. Both directions use the same PHY, as the radio switches
   PHYs only while it is disabled.
 - **Features and parameters:** once the link is encrypted it asks for the central's features; a connection parameter
-  request from the host goes out with the connection parameters request procedure if the central supports it.
+  request from the host goes out with the connection parameters request procedure if the central supports it, on an
+  encrypted link or not.
 - **LE power control:** a central can ask for another transmit power, learns of the link layer's own changes and how
   far it could lower its own power. The transmit power also follows the link on its own: the radio measures the
   signal of every packet from the central and, taking the path as symmetric, lowers the power from 0 dBm in steps
