@@ -8,6 +8,9 @@ readme = "readme.md"
 
 [features]
 defmt = ["dep:defmt", "bt-hci/defmt", "embassy-time/defmt"]
+# Data length extension: payloads of up to 251 octets instead of 27, at
+# about 2.3 KB more static RAM for the larger packet buffers.
+data-length = []
 
 [dependencies]
 bt-hci = { version = "0", default-features = false }

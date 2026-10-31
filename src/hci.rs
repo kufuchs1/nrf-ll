@@ -38,14 +38,14 @@ pub const CONNECTION_HANDLE: u16 = 0;
 /// Largest ACL payload the host and the link layer exchange at once: one
 /// HCI ACL packet, and the longest link layer data PDU payload with the data
 /// length extension.
-pub const ACL_MAX: usize = 251;
+pub const ACL_MAX: usize = if cfg!(feature = "data-length") { 251 } else { 27 };
 /// Shortest data PDU payload and its time on the air, the defaults of the
 /// data length extension (Core, Vol 6, Part B, 4.5.10).
 pub const LENGTH_DEFAULT: [u16; 2] = [27, 328];
 /// Longest supported data PDU payload and its time on LE 1M with a MIC.
-pub const LENGTH_MAX: [u16; 2] = [251, 2120];
+pub const LENGTH_MAX: [u16; 2] = if cfg!(feature = "data-length") { [251, 2120] } else { LENGTH_DEFAULT };
 /// ACL buffers towards the air.
-const ACL_OUT_BUFFERS: usize = 4;
+const ACL_OUT_BUFFERS: usize = if cfg!(feature = "data-length") { 2 } else { 4 };
 /// Largest host event: Command Complete with the 64-byte supported-command
 /// bitmap.
 const PACKET_MAX: usize = 70;
@@ -1828,7 +1828,7 @@ impl<'shared> Hci<'shared> {
     }
 
     /// Runs LE Set Data Length. Returns the status.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "data-length"))]
     pub(crate) fn set_data_length(&self, params: &[u8]) -> u8 { self.length_command(0x2022, params, &mut [0; 8]).0 }
 }
 

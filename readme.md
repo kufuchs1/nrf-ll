@@ -33,7 +33,7 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   an LL response timeout, as any other procedure does.
 - **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
   previous one reported its LE Connection Update Complete event.
-- **Data length extension:** payloads of up to 251 octets each way instead of 27. The link layer receives 251 octets
+- **Data length extension** (feature `data-length`): payloads of up to 251 octets each way instead of 27. The link layer receives 251 octets
   from the start and tells a central that asks (LL_LENGTH_REQ). It sends longer packets once the host allows them for
   the link (LE Set Data Length, TrouBLE's `Connection::update_data_length`) or for new links (LE Write Suggested
   Default Data Length), and then asks the central itself; a longer length only takes effect once the central was told
@@ -114,14 +114,16 @@ interframe space.
 nrf-ll = { git = "https://example.org/you/nrf-ll", branch = "main" }
 ```
 
-Enable the `defmt` feature for logs. The crate follows Embassy's main branch: patch the Embassy crates to it as in
+Enable the `defmt` feature for logs, and `data-length` for payloads of up to 251 octets. That feature costs about
+1.5 KB more static RAM, which on the nRF52832 comes out of the stack; without it the link layer answers a central's
+data length request with the 27-octet default. The crate follows Embassy's main branch: patch the Embassy crates to it as in
 [`Cargo.toml`](Cargo.toml).
 
 ## Checks
 
 ```sh
-cargo test                                         # host tests
-cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt
+cargo test                                         # host tests, also with --features data-length
+cargo clippy --target thumbv7em-none-eabihf        # lints, also with --features defmt and data-length
 ```
 
 ## License
