@@ -3,7 +3,7 @@
 
 use crate::{
     advertiser::legacy::{self, Kind, Settings},
-    clock::Clock,
+    clock::{Clock, SETUP_US},
     connection::{Connection, Ended},
     hci::{ConnectionParams, Packet, Shared},
     log::info,
@@ -85,7 +85,10 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         let started = clock.now();
         let Some((request, end)) = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx) else {
             let next = started.wrapping_add(interval(&settings).await);
-            if !clock.sleep_until(next, shared.changed()).await {
+            // The sleep returns `SETUP_US` early, for a radio start the timer
+            // triggers; advertising starts when it returns, so it sleeps that
+            // much longer to keep the advertising interval.
+            if !clock.sleep_until(next.wrapping_add(SETUP_US), shared.changed()).await {
                 since = None;
             }
             continue;

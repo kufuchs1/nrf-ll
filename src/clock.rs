@@ -92,8 +92,9 @@ const RTC_SYNC: usize = 1;
 const RTC_MASK: u32 = 0x00FF_FFFF;
 /// Smallest distance from the current RTC tick a compare event needs.
 const RTC_MIN_TICKS: u32 = 2;
-/// Time from the TIMER0 restart until the time slept for.
-const SETUP_US: u32 = 300;
+/// Time from the TIMER0 restart until the time slept for: how early
+/// [`Clock::sleep_until`] returns, for the caller to program a radio start.
+pub const SETUP_US: u32 = 300;
 /// Shortest wait for which TIMER0 and the crystal stop.
 const SLEEP_MIN_US: u32 = 3000;
 

@@ -187,6 +187,11 @@ impl Connection {
                 {
                     *target = source;
                 }
+                // No preferred periodicity of ours: the central's could exceed
+                // the host's interval range, which a central rejects.
+                if let Some(periodicity) = response.get_mut(9) {
+                    *periodicity = 0;
+                }
                 self.enqueue(Llid::Control, &response);
                 self.remote_update = Some(now.wrapping_add(PROCEDURE_TIMEOUT_US));
             },
@@ -399,8 +404,9 @@ impl Connection {
                 self.param_request = None;
                 self.param_status = Some(error);
             },
-            // The central ended its own request after our response.
-            OP_CONNECTION_PARAM_REQ => self.remote_update = None,
+            // The central ended its own request after our response, naming
+            // the response as the specification says, or its request.
+            OP_CONNECTION_PARAM_REQ | OP_CONNECTION_PARAM_RSP => self.remote_update = None,
             _ => {},
         }
     }

@@ -1213,7 +1213,7 @@ impl<'shared> Hci<'shared> {
     }
 
     /// Starts a command answered with a command status. Returns the status.
-    fn command_async(&self, opcode: u16, params: &[u8]) -> u8 {
+    pub(crate) fn command_async(&self, opcode: u16, params: &[u8]) -> u8 {
         if opcode == 0x2013 {
             return self.connection_update(params);
         }
@@ -1389,19 +1389,19 @@ impl<'shared> Hci<'shared> {
             if !valid {
                 return STATUS_INVALID_PARAMETERS;
             }
-            // While the host answers a central's request, as TrouBLE's
-            // `ConnectionParamsRequest::accept` does with this command first,
-            // the central's procedure carries the parameters: nothing to do.
-            if state.active_queries & QUERY_REMOTE_PARAMETERS != 0 {
-                return STATUS_SUCCESS;
-            }
             // One update at a time, as in Zephyr: a second request would
             // replace the first, whose complete event the host then never
             // gets.
             if state.active_queries & QUERY_CONNECTION_UPDATE != 0 {
                 return STATUS_DISALLOWED;
             }
-            if state.remote_features & 0x02 == 0 {
+            // A central that asked for parameters itself, as it does while
+            // the host answers (TrouBLE's `ConnectionParamsRequest::accept`
+            // sends this command first), knows the procedure. The request
+            // waits until the central's update is in place; parameters it
+            // already meets complete it at once, others are asked for.
+            let central_asked = state.active_queries & QUERY_REMOTE_PARAMETERS != 0;
+            if state.remote_features & 0x02 == 0 && !central_asked {
                 return STATUS_UNSUPPORTED_REMOTE_FEATURE;
             }
             state.active_queries |= QUERY_CONNECTION_UPDATE;
@@ -2287,10 +2287,12 @@ mod tests {
         let update = [0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0];
         // Before the feature exchange LE Connection Update is refused...
         assert_eq!(hci.command_async(0x2013, &update), STATUS_UNSUPPORTED_REMOTE_FEATURE);
-        // ...but not as TrouBLE's accept of a central's request.
+        // ...but not as TrouBLE's accept of a central's request, which the
+        // link layer completes once the central's update is in place.
         shared.ask_parameters();
         assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
-        assert!(shared.take_param_request().is_none());
+        assert_eq!(shared.take_param_request(), Some([6, 12, 0, 100]));
+        assert_eq!(hci.command_async(0x2013, &update), STATUS_DISALLOWED);
         assert_eq!(hci.reply_parameters(0x2020, &[0, 0, 6, 0, 12, 0, 0, 0, 100, 0, 0, 0, 0, 0]), STATUS_SUCCESS);
     }
 }
