@@ -35,8 +35,9 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   signal of every packet from the central and, taking the path as symmetric, lowers the power from 0 dBm in steps
   down to -20 dBm while the central would still hear the device well, and raises it again, up to +4 dBm, when the
   signal weakens or the central does not acknowledge a packet; after that it waits 64 packets before stepping down. A
-  central that asked for a power has measured the device's signal itself, so the link layer never steps below that
-  power on its own until the central asks for less. Advertising always uses 0 dBm.
+  power a central asked for is kept as a floor for 1024 received packets (about 8 s of traffic at 7.5 ms); then the
+  link layer decides again and reports each change to a central that asked for reports. Some centrals ask for the
+  maximum once and never again. Advertising always uses 0 dBm.
 - **Connection events with several packets:** the event goes on while the central or the link layer has more data
   (MD) and another exchange fits before the next event. Received payloads wait in plain text and are handled after
   the event, so the answer within the 150 µs interframe space stays short. A control PDU, a CRC error, a payload
@@ -51,17 +52,32 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
 The host stack can take its random numbers from the hardware generator ([`random`](src/hci.rs)) and AES-128 from the
 hardware AES ([`encrypt_block`](src/crypto.rs), the ECB). The resolvable private addresses and the identity resolving
 keys use the ECB as well. It shares its AES core with the link encryption, which aborts it during a radio event: each
-block runs with interrupts off and is retried after an abort, once the link layer has handled the event.
+block runs with interrupts off and is retried after an abort, once the link layer has handled the event. The CPU
+sleeps until the ECB ends, woken by its pending interrupt; keep the `ECB` interrupt disabled in the NVIC.
 
 ## Power
+
+The radio uses the fast ramp-up of 40 µs instead of 140 µs, which shortens every receive window and turnaround by
+100 µs. The radio's own interframe timing works only with the slow ramp-up, so TIMER1 times the 150 µs between two
+packets as in Zephyr's software switch: PPI channel 4 starts it at the end of a packet, and its compare enables the
+radio through PPI channel 5. Pass `TIMER1` to `Radio::new` and keep the `TIMER1` interrupt disabled
+in the NVIC. The link layer uses the programmable PPI channels 0, 1, 3, 4 and 5; leave them to it.
 
 The 32 MHz crystal and TIMER0 run only around radio events and RC calibrations. Between events RTC0 keeps the time and
 restarts TIMER0 at an exact tick before the next event. During radio events the CPU sleeps with `WFE` inside the link
 layer interrupt and wakes only on the radio events and, for the end of a receive window, a TIMER0 compare, instead of
 polling them. Their interrupts stay disabled in the NVIC and only mark themselves pending, so keep the `RADIO` and
 `TIMER0` interrupts disabled there. Only the short waits for an RTC compare a few ticks ahead also wake on the RTC tick
-(30.5 µs). The RC
-oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
+(30.5 µs).
+
+The crystal starts 800 µs before TIMER0 at first. That lead then follows the crystal: 10 µs shorter after each restart
+whose crystal already ran 100 µs before it, 100 µs longer after one whose crystal was late, within 300 to 1500 µs. A
+late crystal costs no event: TIMER0 starts 300 µs before the radio. The 10 s connection report shows the lead.
+
+The random delay of each advertising event and the entropy of each encryption start come from the RNG interrupt while
+other tasks run: bind and enable `RNG` to `rng::on_interrupt`.
+
+The RC oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
 once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
 `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable `TEMP` to
 `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for its first

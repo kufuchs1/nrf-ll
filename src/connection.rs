@@ -130,7 +130,7 @@ const OWN_SCA_PPM: u32 = 500;
 /// Queued PDUs.
 const QUEUE_LEN: usize = 4;
 /// Radio ramp-up time.
-const RAMP_UP_US: u32 = 140;
+const RAMP_UP_US: u32 = crate::radio::RX_READY_US;
 /// Extra listening before the earliest expected packet.
 const RX_MARGIN_US: u32 = 30;
 /// Extra listening after the latest expected access address.
@@ -738,41 +738,50 @@ impl Connection {
                 crypto::disarm();
                 return None;
             };
-            radio.wait_disabled();
-            radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
             if asymmetric {
+                // The other PHY is set while the radio is disabled, and the
+                // answer started from TIMER0 in its place.
+                radio.wait_disabled();
                 radio.set_phy(self.tx_phy);
-                radio.set_fast_ramp(true);
                 if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
-                    radio.set_fast_ramp(false);
                     crypto::disarm();
                     self.abort = Some(ERROR_HARDWARE_FAILURE);
                     return None;
                 }
+            } else {
+                // The switch started the answer; the next turnaround follows
+                // its end.
+                radio.wait_switched();
+                radio.set_turnaround(if more { Turnaround::Receive } else { Turnaround::None });
             }
             radio.wait_end();
             clock.cancel_start();
             if !more {
                 break;
             }
-            // The shortcut starts receiving once the transmission ends.
-            radio.wait_disabled();
-            radio.set_turnaround(Turnaround::Transmit);
+            // The switch starts receiving one interframe space after the
+            // end; the buffer and the decryption are ready before.
             // SAFETY: as for `prepare` above.
             let () = unsafe { radio.rearm_receive(rx.as_mut_ptr()) };
+            if !self.arm_decryption(rx) {
+                radio.disable();
+                crypto::disarm();
+                return Some(anchor);
+            }
+            radio.wait_switched();
+            radio.set_turnaround(Turnaround::Transmit);
             let listen_until = clock
                 .end_time()
                 .wrapping_add(T_IFS_US)
                 .wrapping_add(self.phy.address_offset_us())
                 .wrapping_add(RX_TAIL_US);
-            if !self.arm_decryption(rx) || !Self::wait_address(radio, clock, listen_until) {
+            if !Self::wait_address(radio, clock, listen_until) {
                 radio.disable();
                 crypto::disarm();
                 return Some(anchor);
             }
         }
         radio.wait_disabled();
-        radio.set_fast_ramp(false);
         crypto::disarm();
         Some(anchor)
     }
@@ -1257,16 +1266,17 @@ impl Connection {
     }
 
     /// Logs the counters since the last call.
-    fn report(&mut self, late: u32) {
+    fn report(&mut self, (late, lead): (u32, u32)) {
         let (last, last_late) = self.reported;
         info!(
-            "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal, {} dBm, drift {} of +-{} us",
+            "10 s: {} events, {} skipped, {} missed, {} crc errors, {} packets, {} late crystal (lead {} us), {} dBm, drift {} of +-{} us",
             self.stats.events.wrapping_sub(last.events),
             self.stats.skipped.wrapping_sub(last.skipped),
             self.stats.missed.wrapping_sub(last.missed),
             self.stats.crc_errors.wrapping_sub(last.crc_errors),
             self.stats.received.wrapping_sub(last.received),
             late.wrapping_sub(last_late),
+            lead,
             tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()),
             self.drift.0,
             self.drift.1
@@ -1453,7 +1463,7 @@ impl Connection {
                 break ended;
             }
             if reached(clock.now(), self.report_at) {
-                self.report(clock.late());
+                self.report((clock.late(), clock.lead()));
             }
             self.counter = self.counter.wrapping_add(1);
         };

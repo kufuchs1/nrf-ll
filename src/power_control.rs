@@ -12,10 +12,12 @@
 //! received say nothing about this side's power and are ignored.
 //!
 //! A central that runs power control measures this side's signal itself and
-//! asks for a change. Its request becomes the floor: the own control never
-//! steps below it, as the estimate that the central would hear less is the
-//! one it just contradicted. A later request of the central lowers the floor
-//! again.
+//! asks for a change. Its request becomes a floor for [`FLOOR_HOLD`]
+//! received packets: the own control does not step below it in that time.
+//! Afterwards the own control decides again, and each change it makes is
+//! reported to a central that asked for reports. Some centrals ask for the
+//! maximum once and never again, which a permanent floor would keep for the
+//! whole connection. A later request of the central sets a new floor.
 
 /// Transmit power levels in dBm, lowest first.
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
@@ -27,6 +29,8 @@ const TARGET_HIGH_DBM: i32 = -60;
 const TARGET_LOW_DBM: i32 = -72;
 /// Received packets after a loss before the power may step down again.
 const HOLD_AFTER_LOSS: u8 = 64;
+/// Received packets for which a level the central asked for is a floor.
+const FLOOR_HOLD: u16 = 1024;
 /// Received packets between two decisions.
 const SAMPLES_PER_DECISION: u8 = 16;
 /// Fixed point factor of the average.
@@ -38,16 +42,18 @@ const SMOOTHING_SHIFT: u32 = 3;
 #[derive(Clone, Copy)]
 pub struct PowerControl {
     /// Average received signal strength in dBm times [`SCALE`].
-    average: Option<i32>,
+    average:    Option<i32>,
     /// Index into [`LEVELS_DBM`] the own control does not step below: the
-    /// level the central last asked for.
-    floor:   usize,
+    /// level the central last asked for, while it holds.
+    floor:      usize,
+    /// Received packets until the floor ends.
+    floor_left: u16,
     /// Received packets until the power may step down again.
-    hold:    u8,
+    hold:       u8,
     /// Index into [`LEVELS_DBM`].
-    level:   usize,
+    level:      usize,
     /// Samples since the last decision.
-    samples: u8,
+    samples:    u8,
 }
 
 impl PowerControl {
@@ -76,12 +82,13 @@ impl PowerControl {
     pub const fn level(&self) -> usize { self.level }
 
     /// Moves to the level closest to `dbm`, as the central asked, and keeps
-    /// the own control from stepping below it.
+    /// the own control from stepping below it for [`FLOOR_HOLD`] packets.
     #[inline]
     pub fn move_to(&mut self, dbm: i32) {
         let closest = LEVELS_DBM.iter().enumerate().min_by_key(|&(_, &level)| i32::from(level).abs_diff(dbm));
         self.level = closest.map_or(self.level, |(index, _)| index);
         self.floor = self.level;
+        self.floor_left = FLOOR_HOLD;
         self.samples = 0;
         self.hold = HOLD_AFTER_LOSS;
     }
@@ -89,7 +96,9 @@ impl PowerControl {
     /// Starts at [`DEFAULT_LEVEL`].
     #[inline]
     #[must_use = "the control is only created"]
-    pub const fn new() -> Self { Self { average: None, floor: 0, hold: 0, level: DEFAULT_LEVEL, samples: 0 } }
+    pub const fn new() -> Self {
+        Self { average: None, floor: 0, floor_left: 0, hold: 0, level: DEFAULT_LEVEL, samples: 0 }
+    }
 
     /// Takes a packet of ours that the central did not acknowledge.
     #[inline]
@@ -110,6 +119,12 @@ impl PowerControl {
         );
         self.samples = self.samples.saturating_add(1);
         self.hold = self.hold.saturating_sub(1);
+        if self.floor_left != 0 {
+            self.floor_left = self.floor_left.saturating_sub(1);
+            if self.floor_left == 0 {
+                self.floor = 0;
+            }
+        }
         if self.samples >= SAMPLES_PER_DECISION {
             self.samples = 0;
             self.decide();
@@ -218,5 +233,17 @@ mod tests {
             control.on_packet(40);
         }
         assert_eq!(control.level(), DEFAULT_LEVEL - 1);
+    }
+
+    #[test]
+    fn a_level_the_central_asked_for_holds_only_for_a_while() {
+        let mut control = PowerControl::new();
+        control.move_to(4);
+        for _ in 0..FLOOR_HOLD - 1 {
+            control.on_packet(40);
+        }
+        assert_eq!(control.level(), LEVELS_DBM.len() - 1);
+        settle(&mut control, 40);
+        assert_eq!(control.level(), 0);
     }
 }

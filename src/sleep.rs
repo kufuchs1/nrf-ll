@@ -29,10 +29,12 @@ fn clear() {
     RTC.events_tick().write_value(0);
     // Reading back completes the write before the NVIC is sampled again.
     _ = RTC.events_tick().read();
+    interrupt::ECB.unpend();
     interrupt::RADIO.unpend();
     interrupt::RNG.unpend();
     interrupt::RTC0.unpend();
     interrupt::TIMER0.unpend();
+    interrupt::TIMER1.unpend();
 }
 
 /// Lets pending interrupts wake `WFE`. Interrupts that are enabled in the

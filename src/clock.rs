@@ -57,8 +57,15 @@ static CRYSTAL_STARTED: AtomicWaker = AtomicWaker::new();
 static TEMPERATURE_READY: AtomicWaker = AtomicWaker::new();
 /// Time after which the crystal is started again when it does not run.
 const CRYSTAL_RETRY_US: u32 = 2000;
-/// Time the high frequency crystal gets to start before TIMER0 restarts.
+/// Time the high frequency crystal gets to start before TIMER0 restarts, at
+/// first. It then follows the crystal: see [`Clock::lead`].
 const CRYSTAL_LEAD_US: u32 = 800;
+/// Bounds of the crystal lead time.
+const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
+/// Lead time given up after a restart whose crystal ran early.
+const CRYSTAL_LEAD_DOWN_US: u32 = 10;
+/// Lead time added after a restart whose crystal was late.
+const CRYSTAL_LEAD_UP_US: u32 = 100;
 /// Time before TIMER0 restarts at which the task wakes to wait for it.
 const RESUME_EARLY_US: u32 = 100;
 /// Fixed PPI channel: TIMER0 COMPARE0 to RADIO TXEN.
@@ -105,6 +112,8 @@ pub struct Clock<'peripherals> {
     base:   u32,
     /// Restarts at which the crystal was not running yet.
     late:   u32,
+    /// Current crystal lead time.
+    lead:   u32,
     /// RTC tick and time at it while TIMER0 is stopped.
     paused: Option<(u32, u32)>,
 }
@@ -154,9 +163,10 @@ impl<'clock, 'peripherals> ResumeGuard<'clock, 'peripherals> {
     }
 
     /// Acquires the crystal only once the scheduled wake time is reached.
-    fn request(&mut self) {
-        request_crystal();
+    /// Returns whether this started it.
+    fn request(&mut self) -> bool {
         self.requested = true;
+        request_crystal()
     }
 }
 
@@ -234,12 +244,17 @@ impl<'peripherals> Clock<'peripherals> {
     pub fn expired(&self, at: u32) -> bool { REGS.events_compare(CC_START).read() != 0 || reached(self.now(), at) }
 
     /// Waits until TIMER0 restarted at RTC tick `tick + ticks` and continues
-    /// the time from `time` at `tick`.
-    async fn finish_resume(&mut self, tick: u32, time: u32, ticks: u32) {
+    /// the time from `time` at `tick`. If this restart `started` the
+    /// crystal, the lead time follows it: shorter when the crystal already
+    /// ran shortly before the restart, longer when it was late.
+    async fn finish_resume(&mut self, tick: u32, time: u32, ticks: u32, started: bool) {
         let remaining = ticks.wrapping_sub(rtc_now().wrapping_sub(tick) & RTC_MASK);
-        if is_ahead(remaining) {
+        let early = if is_ahead(remaining) {
             Timer::after_micros(u64::from(ticks_to_us(remaining).saturating_sub(RESUME_EARLY_US))).await;
-        }
+            crystal_running()
+        } else {
+            false
+        };
         let target = tick.wrapping_add(ticks) & RTC_MASK;
         let mut started_at = ticks;
         sleep::until_tick(|| RTC.events_compare(RTC_RESUME).read() != 0 || passed(target));
@@ -251,9 +266,17 @@ impl<'peripherals> Clock<'peripherals> {
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.base = time.wrapping_add(ticks_to_us(started_at));
         self.paused = None;
+        let (shortest, longest) = CRYSTAL_LEAD_RANGE_US;
         if !crystal_running() {
             self.late = self.late.wrapping_add(1);
+            if started {
+                self.lead = self.lead.saturating_add(CRYSTAL_LEAD_UP_US).min(longest);
+            }
             self.wait_crystal().await;
+        } else if started && early {
+            self.lead = self.lead.saturating_sub(CRYSTAL_LEAD_DOWN_US).max(shortest);
+        } else {
+            // The crystal came up within the last moments: the lead fits.
         }
     }
 
@@ -276,6 +299,13 @@ impl<'peripherals> Clock<'peripherals> {
     #[inline]
     #[must_use = "the count is only read"]
     pub const fn late(&self) -> u32 { self.late }
+
+    /// Time the crystal currently gets to start before an event. It shrinks
+    /// while the crystal runs at least 100 us before TIMER0 restarts and
+    /// grows when it was late, within 300 to 1500 us.
+    #[inline]
+    #[must_use = "the lead time is only read"]
+    pub const fn lead(&self) -> u32 { self.lead }
 
     /// Sets up the timer, the RTC and the capture channels. The clock starts
     /// paused.
@@ -305,7 +335,7 @@ impl<'peripherals> Clock<'peripherals> {
             w.set_ch(PPI_ADDRESS, true);
             w.set_ch(PPI_END, true);
         });
-        Self { _rtc: rtc, _timer: timer, base: 0, late: 0, paused: Some((rtc_now(), 0)) }
+        Self { _rtc: rtc, _timer: timer, base: 0, late: 0, lead: CRYSTAL_LEAD_US, paused: Some((rtc_now(), 0)) }
     }
 
     /// The current time. While paused it follows the RTC, to about 30 us.
@@ -355,13 +385,13 @@ impl<'peripherals> Clock<'peripherals> {
     pub async fn resume_now(&mut self) {
         let Some((tick, time)) = self.paused else { return };
         let mut restart = ResumeGuard::new(self, (tick, time));
-        restart.request();
+        let started = restart.request();
         let elapsed = rtc_now().wrapping_sub(tick) & RTC_MASK;
-        let ticks = elapsed.saturating_add(us_to_ticks(CRYSTAL_LEAD_US)).saturating_add(RTC_MIN_TICKS);
+        let ticks = elapsed.saturating_add(us_to_ticks(restart.clock.lead)).saturating_add(RTC_MIN_TICKS);
         RTC.cc(RTC_RESUME).write(|w| w.set_compare(tick.wrapping_add(ticks) & RTC_MASK));
         RTC.events_compare(RTC_RESUME).write_value(0);
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
-        restart.clock.finish_resume(tick, time, ticks).await;
+        restart.clock.finish_resume(tick, time, ticks, started).await;
         restart.finish();
     }
 
@@ -386,7 +416,7 @@ impl<'peripherals> Clock<'peripherals> {
         let ticks = us_to_ticks(at.wrapping_sub(SETUP_US).wrapping_sub(time));
         let resume = tick.wrapping_add(ticks) & RTC_MASK;
         let elapsed = rtc_now().wrapping_sub(tick) & RTC_MASK;
-        if ticks < elapsed.saturating_add(us_to_ticks(CRYSTAL_LEAD_US)).saturating_add(RTC_MIN_TICKS) {
+        if ticks < elapsed.saturating_add(us_to_ticks(self.lead)).saturating_add(RTC_MIN_TICKS) {
             self.resume_now().await;
             return true;
         }
@@ -394,12 +424,12 @@ impl<'peripherals> Clock<'peripherals> {
         RTC.cc(RTC_RESUME).write(|w| w.set_compare(resume));
         RTC.events_compare(RTC_RESUME).write_value(0);
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
-        let wake = ticks_to_us(ticks.wrapping_sub(elapsed)).saturating_sub(CRYSTAL_LEAD_US);
+        let wake = ticks_to_us(ticks.wrapping_sub(elapsed)).saturating_sub(restart.clock.lead);
         if let Either::Second(_) = select(Timer::after_micros(u64::from(wake)), interrupt).await {
             return false;
         }
-        restart.request();
-        restart.clock.finish_resume(tick, time, ticks).await;
+        let started = restart.request();
+        restart.clock.finish_resume(tick, time, ticks, started).await;
         restart.finish();
         true
     }
@@ -596,7 +626,8 @@ fn release_crystal() {
 }
 
 /// Adds a user of the high frequency crystal and starts it for the first.
-fn request_crystal() {
+/// Returns whether it was started.
+fn request_crystal() -> bool {
     CRYSTAL_USERS.lock(|users| {
         let count = users.get();
         users.set(count.saturating_add(1));
@@ -604,7 +635,8 @@ fn request_crystal() {
             CLOCK.events_hfclkstarted().write_value(0);
             CLOCK.tasks_hfclkstart().write_value(1);
         }
-    });
+        count == 0
+    })
 }
 
 /// Whether the RTC counter is past `tick`.

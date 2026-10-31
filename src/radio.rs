@@ -9,13 +9,16 @@ use embassy_nrf::{
     Peri,
     interrupt::{self, InterruptExt as _},
     pac::{
+        PPI,
         RADIO as REGS,
+        TIMER1 as SWITCH,
         radio::{
             regs::Int,
             vals::{Crcstatus, Endian, Len, Mode, Plen, Ru, S1incl, Skipaddr, State, Txpower},
         },
+        timer::vals::{Bitmode, Mode as TimerMode},
     },
-    peripherals::RADIO,
+    peripherals::{RADIO, TIMER1},
 };
 
 /// Register holding the enable bit for the fixes of anomalies 102, 106 and
@@ -33,6 +36,19 @@ const IFS_US: u8 = 150;
 const LENGTH_BITS: u8 = 8;
 /// Largest payload the radio accepts.
 const MAX_PAYLOAD: u8 = 255;
+/// Programmable PPI channel: RADIO END to TIMER1 START, which times the
+/// turnaround after a packet.
+const PPI_SWITCH_START: usize = 4;
+/// Programmable PPI channel: TIMER1 COMPARE0 to RADIO TXEN or RXEN.
+const PPI_SWITCH_ENABLE: usize = 5;
+/// Receiver ready time after RXEN with fast ramp-up.
+pub const RX_READY_US: u32 = 40;
+/// Time by which the receiver is ready before the earliest packet start one
+/// interframe space after our packet: the peer may be 2 us early, and the
+/// receiver locks onto the preamble before the access address.
+const RX_EARLY_US: u32 = 8;
+/// TIMER1 ticks per microsecond, at 16 MHz.
+const SWITCH_TICKS_PER_US: u32 = 16;
 /// Whitening initial value bit that the radio requires to be set.
 const WHITENING_BIT6: u8 = 0x40;
 
@@ -79,6 +95,20 @@ impl Phy {
         }
     }
 
+    /// TIMER RXEN offset from the END of our packet sent on this PHY, so the
+    /// receiver is ready shortly before a packet one interframe space later.
+    /// The fast ramp-up and TX chain timings follow Zephyr's Nordic HAL.
+    #[must_use = "the delay is only computed"]
+    #[inline]
+    pub const fn listen_offset_us(self) -> u32 {
+        let rx_ready_ns = RX_READY_US.saturating_mul(1000);
+        let tx_chain_ns = 600_u32;
+        let Some(delay) = rx_ready_ns.saturating_add(tx_chain_ns).saturating_add(999).checked_div(1000) else {
+            return 0;
+        };
+        150_u32.saturating_sub(delay).saturating_sub(RX_EARLY_US)
+    }
+
     /// TIMER TXEN offset from RX END for a 150-us interframe space.
     /// nRF52832 fast-ramp and RX-chain timings match Zephyr's Nordic HAL.
     #[must_use = "the delay is only computed"]
@@ -100,6 +130,11 @@ impl Phy {
 }
 
 /// What the radio does after a packet.
+///
+/// A turnaround is timed by TIMER1,
+/// which PPI starts at the packet END, and whose compare enables the radio
+/// one interframe space after the packet, as Zephyr's software switch does:
+/// the radio's own interframe timing works only with the slow ramp-up.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Turnaround {
@@ -111,10 +146,14 @@ pub enum Turnaround {
     Transmit,
 }
 
-/// The radio, configured for BLE 1 Mbit.
+/// The radio, configured for BLE with fast ramp-up.
 pub struct Radio<'peripherals> {
     /// The radio peripheral, owned for the lifetime of the driver.
-    _radio: Peri<'peripherals, RADIO>,
+    _peripheral: Peri<'peripherals, RADIO>,
+    /// The timer of the turnarounds, owned for the lifetime of the driver.
+    _switch:     Peri<'peripherals, TIMER1>,
+    /// PHY the turnarounds are timed for.
+    phy:         Phy,
 }
 
 impl<'peripherals> Radio<'peripherals> {
@@ -160,7 +199,7 @@ impl<'peripherals> Radio<'peripherals> {
     /// frequency crystal must be running.
     #[inline]
     #[must_use = "the radio is unusable once dropped"]
-    pub fn new(radio: Peri<'peripherals, RADIO>) -> Self {
+    pub fn new(radio: Peri<'peripherals, RADIO>, switch: Peri<'peripherals, TIMER1>) -> Self {
         sleep::enable();
         REGS.power().write(|w| w.set_power(true));
         let register = with_exposed_provenance_mut::<u32>(ANOMALY_182_REGISTER);
@@ -169,8 +208,21 @@ impl<'peripherals> Radio<'peripherals> {
         // SAFETY: Nordic documents this write for the anomaly 182 fix.
         let () = unsafe { write_volatile(register, value | ANOMALY_182_BIT) };
         REGS.mode().write(|w| w.set_mode(Mode::Ble1mbit));
-        REGS.modecnf0().write(|w| w.set_ru(Ru::Default));
+        REGS.modecnf0().write(|w| w.set_ru(Ru::Fast));
         REGS.tifs().write(|w| w.set_tifs(IFS_US));
+        SWITCH.tasks_stop().write_value(1);
+        SWITCH.mode().write(|w| w.set_mode(TimerMode::Timer));
+        SWITCH.bitmode().write(|w| w.set_bitmode(Bitmode::_16bit));
+        SWITCH.prescaler().write(|w| w.set_prescaler(0));
+        SWITCH.shorts().write(|w| {
+            w.set_compare_clear(0, true);
+            w.set_compare_stop(0, true);
+        });
+        SWITCH.tasks_clear().write_value(1);
+        let start = PPI.ch(PPI_SWITCH_START);
+        start.eep().write_value(address(REGS.events_end().as_ptr()));
+        start.tep().write_value(address(SWITCH.tasks_start().as_ptr()));
+        PPI.ch(PPI_SWITCH_ENABLE).eep().write_value(address(SWITCH.events_compare(0).as_ptr()));
         REGS.pcnf0().write(|w| {
             w.set_lflen(LENGTH_BITS);
             w.set_s0len(true);
@@ -191,7 +243,7 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.txaddress().write(|w| w.set_txaddress(0));
         REGS.rxaddresses().write(|w| w.set_addr0(true));
         REGS.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
-        Self { _radio: radio }
+        Self { _peripheral: radio, _switch: switch, phy: Phy::M1 }
     }
 
     /// Clears the events and arms the radio for a reception started by a
@@ -275,15 +327,10 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn set_crc_init(&mut self, init: u32) { REGS.crcinit().write(|w| w.set_crcinit(init)); }
 
-    /// Selects the 40-us ramp for an explicitly timed asymmetric response.
-    #[inline]
-    pub fn set_fast_ramp(&mut self, fast: bool) {
-        REGS.modecnf0().write(|w| w.set_ru(if fast { Ru::Fast } else { Ru::Default }));
-    }
-
     /// Sets the PHY of the following packets. The radio must be disabled.
     #[inline]
     pub fn set_phy(&mut self, phy: Phy) {
+        self.phy = phy;
         REGS.mode().write(|w| {
             w.set_mode(match phy {
                 Phy::M1 => Mode::Ble1mbit,
@@ -321,8 +368,25 @@ impl<'peripherals> Radio<'peripherals> {
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_rxen(turnaround == Turnaround::Receive);
-            w.set_disabled_txen(turnaround == Turnaround::Transmit);
+        });
+        PPI.chenclr().write(|w| {
+            w.set_ch(PPI_SWITCH_START, true);
+            w.set_ch(PPI_SWITCH_ENABLE, true);
+        });
+        SWITCH.tasks_stop().write_value(1);
+        SWITCH.tasks_clear().write_value(1);
+        SWITCH.events_compare(0).write_value(0);
+        let (task, offset) = match turnaround {
+            Turnaround::None => return,
+            Turnaround::Receive => (REGS.tasks_rxen().as_ptr(), self.phy.listen_offset_us()),
+            Turnaround::Transmit => (REGS.tasks_txen().as_ptr(), self.phy.response_offset_us(self.phy)),
+        };
+        SWITCH.cc(0).write_value(offset.saturating_mul(SWITCH_TICKS_PER_US));
+        PPI.ch(PPI_SWITCH_ENABLE).tep().write_value(address(task));
+        compiler_fence(Ordering::SeqCst);
+        PPI.chenset().write(|w| {
+            w.set_ch(PPI_SWITCH_START, true);
+            w.set_ch(PPI_SWITCH_ENABLE, true);
         });
     }
 
@@ -376,7 +440,23 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.events_end().write_value(0);
         compiler_fence(Ordering::SeqCst);
     }
+
+    /// Sleeps until the turnaround set before the last packet END enabled the
+    /// radio again, and clears the disabled event of that packet. Set the
+    /// next turnaround only after this, or it replaces the pending one.
+    #[inline]
+    pub fn wait_switched(&mut self) {
+        SWITCH.intenset().write(|w| w.set_compare(0, true));
+        sleep::until(|| SWITCH.events_compare(0).read() != 0);
+        SWITCH.intenclr().write(|w| w.set_compare(0, true));
+        SWITCH.events_compare(0).write_value(0);
+        REGS.events_disabled().write_value(0);
+        compiler_fence(Ordering::SeqCst);
+    }
 }
+
+/// The address of a register for a PPI endpoint.
+fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 /// Radio frequency offset from 2400 MHz of a BLE channel index.
 const fn frequency(channel: u8) -> u8 {
@@ -398,5 +478,8 @@ mod tests {
         assert_eq!(Phy::M1.response_offset_us(Phy::M2), 103);
         assert_eq!(Phy::M1.response_offset_us(Phy::M1), 100);
         assert_eq!(Phy::M2.response_offset_us(Phy::M2), 105);
+        // Ready 8 us before the earliest packet: 150 - 41 - 8.
+        assert_eq!(Phy::M1.listen_offset_us(), 101);
+        assert_eq!(Phy::M2.listen_offset_us(), 101);
     }
 }
