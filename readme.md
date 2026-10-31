@@ -18,6 +18,7 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   accepts any valid parameters. Every packet
   from the central gets an answer, also one with a CRC error, and sets the anchor; a control PDU of the wrong length
   is answered as unknown.
+- **Read RSSI** answers with the averaged signal strength of the central's packets.
 - **HCI events** follow the host's event masks; a host without the LE enhanced connection complete event gets the
   plain one. Keys the host gave, and the keys of a link, are overwritten once they are no longer needed.
 - **Encryption:** AES-CCM. A central can refresh the key of an encrypted link: encryption pauses and starts again with

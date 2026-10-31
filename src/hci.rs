@@ -17,7 +17,12 @@ use bt_hci::{
     ReadHciError,
     transport::{PacketKind, PacketToController, PacketToHost, Transport},
 };
-use core::{cell::RefCell, convert::Infallible, fmt};
+use core::{
+    cell::RefCell,
+    convert::Infallible,
+    fmt,
+    sync::atomic::{AtomicI8, Ordering},
+};
 use embassy_futures::select::{Either, select};
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
@@ -26,6 +31,8 @@ use embassy_sync::{
 };
 use embassy_time::{Duration, Instant};
 
+/// Read RSSI value while no packet was received.
+const RSSI_UNKNOWN: i8 = 127;
 /// Handle of the only connection.
 pub const CONNECTION_HANDLE: u16 = 0;
 /// Largest ACL payload the host and the link layer exchange at once: one
@@ -689,6 +696,9 @@ pub struct Shared {
     reset:           Signal<CriticalSectionRawMutex, ()>,
     /// Radio reset completion.
     reset_done:      Signal<CriticalSectionRawMutex, ()>,
+    /// Received signal strength of the link in dBm, averaged; 127 while
+    /// unknown.
+    rssi:            AtomicI8,
     /// Host state.
     state:           Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
     /// Something for the connection arrived from the host.
@@ -776,6 +786,7 @@ impl Shared {
         Self {
             reset:           Signal::new(),
             reset_done:      Signal::new(),
+            rssi:            AtomicI8::new(RSSI_UNKNOWN),
             acl_in:          Channel::new(),
             acl_out:         Channel::new(),
             changed:         Signal::new(),
@@ -968,6 +979,7 @@ impl Shared {
             self.param_request.reset();
             self.parameter_reply.reset();
             self.data_length.reset();
+            self.rssi.store(RSSI_UNKNOWN, Ordering::Relaxed);
             self.wakeup.reset();
         }
     }
@@ -980,6 +992,13 @@ impl Shared {
     #[inline]
     pub fn set_remote_features(&self, features: u8) {
         self.state.lock(|cell| cell.borrow_mut().remote_features = features);
+    }
+
+    /// Publishes the averaged signal strength of the link for Read RSSI.
+    pub(crate) fn set_rssi(&self, dbm: Option<i32>) {
+        let value =
+            dbm.map_or(RSSI_UNKNOWN, |level| i8::try_from(level.clamp(-127_i32, 20_i32)).unwrap_or(RSSI_UNKNOWN));
+        self.rssi.store(value, Ordering::Relaxed);
     }
 
     /// Wakes the controller for a reset, including waits under host
@@ -1124,7 +1143,7 @@ impl<'shared> Hci<'shared> {
                 (5, 0xC0),
                 (10, 0x60),
                 (14, 0x28),
-                (15, 0x02),
+                (15, 0x22),
                 (22, 0x04),
                 (25, 0xF7),
                 (26, 0xC3),
@@ -1241,7 +1260,7 @@ impl<'shared> Hci<'shared> {
             return (STATUS_INVALID_PARAMETERS, 0);
         }
         match opcode {
-            0x1001 | 0x1003 | 0x1009 | 0x201C | 0x2030 => self.information_command(opcode, params, returned),
+            0x1001 | 0x1003 | 0x1009 | 0x1405 | 0x201C | 0x2030 => self.information_command(opcode, params, returned),
             // Peer addresses in the resolving list are resolved whenever it
             // holds their key, so enabling resolution changes nothing.
             0x0C31 => {
@@ -1390,6 +1409,18 @@ impl<'shared> Hci<'shared> {
                     returned[4..6].copy_from_slice(&high[..2]);
                 }
                 (STATUS_SUCCESS, 6)
+            },
+            0x1405 => {
+                let Some(&[handle0, handle1]) = params.first_chunk::<2>().filter(|_| params.len() == 2) else {
+                    return (STATUS_INVALID_PARAMETERS, 0);
+                };
+                let connected = self.shared.state.lock(|cell| cell.borrow().connected);
+                if !connected || u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+                    return (STATUS_UNKNOWN_CONNECTION, 0);
+                }
+                let [rssi] = self.shared.rssi.load(Ordering::Relaxed).to_le_bytes();
+                returned[..3].copy_from_slice(&[handle0, handle1, rssi]);
+                (STATUS_SUCCESS, 3)
             },
             0x2030 => {
                 if params.len() != 2 {
@@ -1830,6 +1861,25 @@ mod tests {
         shared.set_connected(true);
         shared.set_remote_features(0x02);
         assert_eq!(hci.command_async(0x2013, &update), STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn read_rssi_reports_the_link_average_or_unknown() {
+        let shared = Shared::new();
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        assert_eq!(hci.command_sync(0x1405, &[0, 0], &mut returned).0, STATUS_UNKNOWN_CONNECTION);
+        shared.set_connected(true);
+        assert_eq!(hci.command_sync(0x1405, &[0, 0], &mut returned), (STATUS_SUCCESS, 3));
+        assert_eq!(returned[2], 127);
+        shared.set_rssi(Some(-61));
+        hci.command_sync(0x1405, &[0, 0], &mut returned);
+        assert_eq!(returned[2].cast_signed(), -61);
+        assert_eq!(hci.command_sync(0x1405, &[1, 0], &mut returned).0, STATUS_UNKNOWN_CONNECTION);
+        shared.set_connected(false);
+        shared.set_connected(true);
+        hci.command_sync(0x1405, &[0, 0], &mut returned);
+        assert_eq!(returned[2], 127);
     }
 
     #[test]

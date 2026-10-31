@@ -742,6 +742,7 @@ impl Connection {
         self.drive_encryption(shared, entropy);
         self.drive_remote_request(now, shared);
         self.drive_length(shared);
+        shared.set_rssi(for_phy_mut(&mut self.power, self.tx_phy).average_dbm());
         self.service_queries(now, shared);
         self.start_procedures(now, shared);
     }
