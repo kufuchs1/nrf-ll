@@ -1310,3 +1310,25 @@ fn a_merged_host_update_completes_with_the_central_rejection() {
     assert_eq!(shared.take_event_code(), Some((0x3E, 0x03)));
     assert_eq!(shared.take_event_code(), None);
 }
+
+#[test]
+fn owed_update_complete_events_wait_for_room_instead_of_being_dropped() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    while shared.try_push_event(Packet::completed_packets(1)) {}
+    let params = link.current_params();
+    link.complete_updates(3, STATUS_SUCCESS, params, &shared);
+    assert_eq!(link.notifications.iter().flatten().count(), 1);
+    assert_eq!(link.updates_owed.0, 2);
+    // The host reads its events: the rest follows in order.
+    let mut updates = 0;
+    for _ in 0..8 {
+        while let Some((code, subevent)) = shared.take_event_code() {
+            updates += usize::from(code == 0x3E && subevent == 0x03);
+        }
+        link.flush_notifications(&shared);
+    }
+    assert_eq!(updates, 3);
+    assert_eq!(link.updates_owed.0, 0);
+    assert!(link.notifications.iter().all(Option::is_none));
+}

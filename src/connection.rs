@@ -594,6 +594,9 @@ pub struct Connection {
     tx_phy:                 Phy,
     /// Encrypted copy of [`Self::tx`] as sent.
     tx_sealed:              [u8; DATA_BUFFER_LEN],
+    /// LE Connection Update Complete events still owed to the host beyond
+    /// the retained notifications, with their status and parameters.
+    updates_owed:           (u8, u8, ConnectionParams),
     /// Remote version, retained once our only version response is queued.
     version:                Option<[u8; 5]>,
     /// Version procedure state, including its response deadline.
@@ -734,14 +737,14 @@ impl Connection {
     /// `params`: the first retained until delivered, any further one if the
     /// host has room.
     fn complete_updates(&mut self, count: u8, status: u8, params: ConnectionParams, shared: &Shared) {
-        for index in 0..count {
-            let event = Packet::connection_update_complete(status, params);
-            if index == 0 {
-                self.notify(event, shared);
-            } else {
-                _ = shared.try_push_event(event);
-            }
+        if count == 0 {
+            return;
         }
+        self.notify(Packet::connection_update_complete(status, params), shared);
+        // Further events follow the retained ones as the host makes room.
+        let (owed, _, _) = self.updates_owed;
+        self.updates_owed = (owed.saturating_add(count.saturating_sub(1)), status, params);
+        self.flush_notifications(shared);
     }
 
     /// Advances the encryption start procedure with the host's answer.
@@ -1020,6 +1023,20 @@ impl Connection {
                 return false;
             }
         }
+        while self.updates_owed.0 != 0 {
+            let (owed, status, params) = self.updates_owed;
+            if matches!(
+                embassy_futures::select::select(
+                    shared.push_event(Packet::connection_update_complete(status, params)),
+                    shared.reset_requested()
+                )
+                .await,
+                embassy_futures::select::Either::Second(())
+            ) {
+                return false;
+            }
+            self.updates_owed.0 = owed.saturating_sub(1);
+        }
         true
     }
 
@@ -1027,12 +1044,19 @@ impl Connection {
     fn flush_notifications(&mut self, shared: &Shared) {
         while let Some(event) = self.notifications.first().copied().flatten() {
             if !shared.try_push_event(event) {
-                break;
+                return;
             }
             self.notifications.rotate_left(1);
             if let Some(last) = self.notifications.last_mut() {
                 *last = None;
             }
+        }
+        let (owed, status, params) = self.updates_owed;
+        for remaining in (0..owed).rev() {
+            if !shared.try_push_event(Packet::connection_update_complete(status, params)) {
+                break;
+            }
+            self.updates_owed.0 = remaining;
         }
     }
 
@@ -1278,6 +1302,11 @@ impl Connection {
             pending: [None; RX_SLOTS],
             remote_request: None,
             remote_update: None,
+            updates_owed: (
+                0,
+                STATUS_SUCCESS,
+                ConnectionParams::new(request.interval, request.latency, request.timeout),
+            ),
             merged_outcome: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
