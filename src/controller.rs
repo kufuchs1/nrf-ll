@@ -58,6 +58,7 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         crate::health::checkpoint(15);
         crate::maintenance::service(clock, radio).await;
         crate::health::checkpoint(15);
+        shared.refresh_private_address();
         let Some(settings) = shared.advertising() else {
             since = None;
             clock.pause();
