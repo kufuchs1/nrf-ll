@@ -19,17 +19,18 @@ use super::{
     OP_PHY_RSP,
     OP_PING_REQ,
     OP_POWER_CHANGE_IND,
+    OP_POWER_CONTROL_REQ,
     OP_POWER_CONTROL_RSP,
     OP_REJECT_EXT_IND,
     OP_REJECT_IND,
     OP_UNKNOWN_RSP,
-    PREFERRED_PHYS,
     PROCEDURE_TIMEOUT_US,
     Phase,
     Request,
     STATUS_SUCCESS,
     UNIT_10MS_US,
     UNIT_1250_US,
+    for_phy_mut,
     future_instant,
     parse_update,
     tx_power,
@@ -43,9 +44,6 @@ use crate::{
     radio::Phy,
 };
 
-/// Weakest signal from the central that keeps a margin, for the acceptable
-/// power reduction reported to it.
-const ACCEPTABLE_DBM: i32 = -70;
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
 /// Error code: different transaction collision, another procedure with an
@@ -59,23 +57,27 @@ impl Connection {
     /// Tells a central that supports power control about a change of the
     /// own transmit power.
     fn announce_power(&mut self) {
-        let level = self.power.level();
+        let level = for_phy_mut(&mut self.power, self.tx_phy).level();
         let supports = self.central_features.is_some_and(|[_, _, _, _, power, ..]| power & 0x02 != 0);
         let free = self.encryption.phase == Phase::Idle && self.queue.iter().all(Option::is_none);
-        if level == self.announced_power || !supports || !free {
+        if level == *for_phy_mut(&mut self.announced_power, self.tx_phy)
+            || !supports
+            || !free
+            || self.power_reporting & self.tx_phy.hci() == 0
+        {
             return;
         }
-        let before = i32::from(tx_power(self.announced_power));
+        let before = i32::from(tx_power(*for_phy_mut(&mut self.announced_power, self.tx_phy)));
         let now = tx_power(level);
         let delta = i8::try_from(i32::from(now).saturating_sub(before)).unwrap_or_default();
         self.enqueue(Llid::Control, &[
             OP_POWER_CHANGE_IND,
-            self.phy.hci(),
+            self.tx_phy.hci(),
             limit_flags(level),
             delta.cast_unsigned(),
             now.cast_unsigned(),
         ]);
-        self.announced_power = level;
+        *for_phy_mut(&mut self.announced_power, self.tx_phy) = level;
     }
 
     /// Keeps authenticated packets coming (LE Ping): pings the central when
@@ -142,7 +144,11 @@ impl Connection {
                 };
                 if !future_instant(self.counter, update.instant) {
                     self.abort = Some(ERROR_INSTANT_PASSED);
-                } else if self.param_update.is_some() {
+                } else if self.param_update.is_some()
+                    || self.phy_update.is_some()
+                    || self.channel_update.is_some()
+                    || self.notifications.iter().flatten().any(Packet::is_parameter_update)
+                {
                     self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                 } else {
                     // The update answers a request of the host; the host
@@ -151,6 +157,11 @@ impl Connection {
                     self.param_update = Some(update);
                 }
             },
+            OP_CONNECTION_PARAM_RSP => {
+                // Only a peripheral sends this PDU; a central answers our
+                // request with UPDATE_IND or REJECT_EXT_IND (Core 5.1.7.2).
+                self.abort = Some(ERROR_PDU_NOT_ALLOWED);
+            },
             OP_CONNECTION_PARAM_REQ => {
                 if !valid_request(params) {
                     self.enqueue(Llid::Control, &[
@@ -158,7 +169,11 @@ impl Connection {
                         OP_CONNECTION_PARAM_REQ,
                         ERROR_INVALID_PARAMETERS,
                     ]);
-                } else if self.param_update.is_some() || self.phy_update.is_some() || self.channel_update.is_some() {
+                } else if self.param_update.is_some()
+                    || self.phy_update.is_some()
+                    || self.channel_update.is_some()
+                    || self.notifications.iter().flatten().any(Packet::is_parameter_update)
+                {
                     self.enqueue(Llid::Control, &[
                         OP_REJECT_EXT_IND,
                         OP_CONNECTION_PARAM_REQ,
@@ -182,34 +197,47 @@ impl Connection {
     /// Answers the PDUs of the PHY update procedure.
     pub(super) fn handle_phy(&mut self, code: u8, params: &[u8]) {
         if code == OP_PHY_REQ {
+            if field::<2>(params, 0).is_none_or(|[tx, rx]| tx.trailing_zeros() >= 2 || rx.trailing_zeros() >= 2) {
+                self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_PHY_REQ, ERROR_UNSUPPORTED_VALUE]);
+                return;
+            }
             // The central's procedure takes the place of ours.
-            self.phy_request = Request::Done;
-            self.enqueue(Llid::Control, &[OP_PHY_RSP, PREFERRED_PHYS, PREFERRED_PHYS]);
+            self.phy_request = Request::Requested(self.last_valid.wrapping_add(PROCEDURE_TIMEOUT_US));
+            let [tx, rx] = self.preferred_phys;
+            self.enqueue(Llid::Control, &[OP_PHY_RSP, tx, rx]);
             return;
         }
         let Some([to_peripheral, to_central, instant0, instant1]) = field::<4>(params, 0) else { return };
         self.phy_request = Request::Done;
         if to_peripheral == 0 && to_central == 0 {
+            if self.host_phy.is_some() {
+                self.phy_status = Some(STATUS_SUCCESS);
+            }
             return;
         }
         let keep = self.phy.hci();
         let receive = Phy::from_bits(if to_peripheral == 0 { keep } else { to_peripheral });
-        let send = Phy::from_bits(if to_central == 0 { keep } else { to_central });
-        // The radio switches PHYs only while disabled, which the hardware
-        // turnaround between receiving and sending skips: both ways match.
+        let send = Phy::from_bits(if to_central == 0 { self.tx_phy.hci() } else { to_central });
+        // Each direction keeps its own PHY. Asymmetric exchanges disable
+        // the RX-to-TX shortcut and use a compensated TIMER/PPI start.
         let (Some(phy), Some(other)) = (receive, send) else {
             self.abort = Some(ERROR_UNSUPPORTED_VALUE);
             return;
         };
         let instant = u16::from_le_bytes([instant0, instant1]);
-        if phy != other {
-            self.abort = Some(ERROR_UNSUPPORTED_VALUE);
-        } else if !future_instant(self.counter, instant) {
+        if !future_instant(self.counter, instant) {
             self.abort = Some(ERROR_INSTANT_PASSED);
-        } else if self.phy_update.is_some() {
+        } else if self.phy_update.is_some()
+            || self.param_update.is_some()
+            || self.channel_update.is_some()
+            || self.notifications.iter().flatten().any(Packet::is_phy_update)
+        {
             self.abort = Some(ERROR_PDU_NOT_ALLOWED);
-        } else if phy != self.phy {
+        } else if phy != self.phy || other != self.tx_phy {
+            self.next_tx_phy = other;
             self.phy_update = Some((phy, instant));
+        } else if self.host_phy.is_some() {
+            self.phy_status = Some(STATUS_SUCCESS);
         } else {
             // The PHY stays: nothing changes at the instant, and the host,
             // which did not ask, learns nothing (Core, Vol 4, Part E,
@@ -219,18 +247,36 @@ impl Connection {
 
     /// Answers the central's request to change the own transmit power by a
     /// delta, with the power now used and how far the central could lower
-    /// its own: the signal above [`ACCEPTABLE_DBM`].
+    /// its own. An unknown acceptable reduction is reported as 0xFF.
     pub(super) fn handle_power(&mut self, params: &[u8]) {
-        let Some([_phy, delta, _central_power]) = field::<3>(params, 0) else { return };
-        let before = tx_power(self.power.level());
-        self.power.move_to(i32::from(before).saturating_add(i32::from(delta.cast_signed())));
-        let level = self.power.level();
+        let Some([phy, delta, central_power]) = field::<3>(params, 0) else { return };
+        let error = if Phy::from_bits(phy).is_none() {
+            Some(ERROR_UNSUPPORTED_VALUE)
+        } else if central_power == 126 {
+            Some(ERROR_INVALID_PARAMETERS)
+        } else {
+            None
+        };
+        if let Some(reason) = error {
+            self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_POWER_CONTROL_REQ, reason]);
+            return;
+        }
+        let Some(request_phy) = Phy::from_bits(phy) else { return };
+        let before = tx_power(for_phy_mut(&mut self.power, request_phy).level());
+        let requested = if delta == 0x7F {
+            i32::from(i8::MAX)
+        } else {
+            i32::from(before).saturating_add(i32::from(delta.cast_signed()))
+        };
+        // Round upward to the lowest available power at least as high as
+        // requested.
+        let requested_level = LEVELS_DBM.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(4);
+        for_phy_mut(&mut self.power, request_phy).move_to(i32::from(requested_level));
+        self.power_reporting |= phy;
+        let level = for_phy_mut(&mut self.power, request_phy).level();
         let now = tx_power(level);
-        info!("central asks for {} dB: {} dBm now", delta.cast_signed(), now);
         let change = i8::try_from(i32::from(now).saturating_sub(i32::from(before))).unwrap_or_default();
-        let reduction = self.power.average_dbm().map_or(UNKNOWN_REDUCTION, |dbm| {
-            u8::try_from(dbm.saturating_sub(ACCEPTABLE_DBM).max(0_i32)).unwrap_or(u8::MAX)
-        });
+        let reduction = UNKNOWN_REDUCTION;
         self.enqueue(Llid::Control, &[
             OP_POWER_CONTROL_RSP,
             limit_flags(level),
@@ -238,7 +284,7 @@ impl Connection {
             now.cast_unsigned(),
             reduction,
         ]);
-        self.announced_power = level;
+        *for_phy_mut(&mut self.announced_power, request_phy) = level;
     }
 
     /// Takes the central's refusal of a procedure of ours: an unknown
@@ -252,8 +298,18 @@ impl Connection {
             _ => return,
         };
         match opcode {
-            OP_PHY_REQ => self.phy_request = Request::Done,
-            OP_PERIPHERAL_FEATURE_REQ => self.features_request = Request::Done,
+            OP_PHY_REQ => {
+                self.phy_request = Request::Done;
+                if self.host_phy.is_some() {
+                    self.phy_status = Some(error);
+                }
+            },
+            OP_PERIPHERAL_FEATURE_REQ => {
+                self.features_request = Request::Done;
+                if self.host_queries & 1 != 0 {
+                    self.feature_error = Some(error);
+                }
+            },
             OP_CONNECTION_PARAM_REQ if self.param_request.is_some() => {
                 self.param_request = None;
                 self.param_status = Some(error);
@@ -285,21 +341,22 @@ impl Connection {
         if let Some(deadline) = self.param_request
             && reached(now, deadline)
         {
-            self.param_request = None;
-            self.param_status = Some(ERROR_RESPONSE_TIMEOUT);
+            self.abort = Some(ERROR_RESPONSE_TIMEOUT);
+            return;
         }
-        for request in [&mut self.features_request, &mut self.phy_request] {
-            if let Request::Requested(deadline) = *request
-                && reached(now, deadline)
-            {
-                *request = Request::Done;
-            }
+        if [self.features_request, self.phy_request]
+            .iter()
+            .any(|request| matches!(request, Request::Requested(deadline) if reached(now, *deadline)))
+        {
+            self.abort = Some(ERROR_RESPONSE_TIMEOUT);
+            return;
         }
         let idle = self.encryption.phase == Phase::Idle
             && self.param_update.is_none()
             && self.phy_update.is_none()
             && self.channel_update.is_none()
-            && self.queue.iter().all(Option::is_none);
+            && self.queue.iter().all(Option::is_none)
+            && self.notifications.iter().all(Option::is_none);
         let ours_running =
             [self.features_request, self.phy_request].iter().any(|request| matches!(request, Request::Requested(_)))
                 || self.param_request.is_some();
@@ -308,15 +365,21 @@ impl Connection {
         }
         let deadline = now.wrapping_add(PROCEDURE_TIMEOUT_US);
         let encrypted = self.encryption.tx_on;
-        if encrypted && self.features_request == Request::NotStarted && self.central_features.is_none() {
+        if (encrypted || self.host_queries & 1 != 0)
+            && self.features_request == Request::NotStarted
+            && self.central_features.is_none()
+        {
             let mut request = [OP_PERIPHERAL_FEATURE_REQ, 0, 0, 0, 0, 0, 0, 0, 0];
             for (target, source) in request.iter_mut().skip(1).zip(FEATURES) {
                 *target = source;
             }
             self.enqueue(Llid::Control, &request);
             self.features_request = Request::Requested(deadline);
-        } else if encrypted && self.phy_request == Request::NotStarted && self.phy == Phy::M1 {
-            self.enqueue(Llid::Control, &[OP_PHY_REQ, PREFERRED_PHYS, PREFERRED_PHYS]);
+        } else if (self.host_phy.is_some() || (encrypted && self.phy == Phy::M1))
+            && self.phy_request == Request::NotStarted
+        {
+            let [tx, rx] = self.preferred_phys;
+            self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
             self.phy_request = Request::Requested(deadline);
         } else if let Some([min, max, latency, timeout]) = shared.take_param_request() {
             let current = self.current_params();

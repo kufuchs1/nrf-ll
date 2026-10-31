@@ -28,6 +28,8 @@ pub mod pdu;
 pub mod power_control;
 /// BLE radio driver.
 pub mod radio;
+/// Shared synchronous and async hardware entropy.
+pub mod rng;
 /// Sleeping on peripheral events.
 mod sleep;
 

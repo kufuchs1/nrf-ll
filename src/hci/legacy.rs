@@ -24,6 +24,17 @@ pub(super) fn command(
     enabled: bool,
     connected: bool,
 ) -> (u8, usize, Option<bool>) {
+    let expected = match opcode {
+        0x2005 => 6,
+        0x2006 => 15,
+        0x2008 | 0x2009 => 32,
+        0x200A => 1,
+        0x2011 | 0x2012 => 7,
+        _ => 0,
+    };
+    if params.len() != expected || (opcode == 0x200A && params.first().is_some_and(|&value| value > 1)) {
+        return (STATUS_INVALID_PARAMETERS, 0, None);
+    }
     let status = match opcode {
         0x2005 => match params.first_chunk::<6>() {
             _ if enabled => STATUS_DISALLOWED,
@@ -149,4 +160,32 @@ fn set_parameters(settings: &mut Settings, params: &[u8]) -> u8 {
     settings.channel_map = channel_map;
     settings.filter_policy = filter_policy;
     STATUS_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_commands_do_not_change_advertising_or_filter_state() {
+        let mut settings = Settings::new();
+        let mut returned = [0; 8];
+        for (opcode, size) in [(0x2005, 6), (0x2006, 15), (0x2008, 32), (0x2009, 32), (0x200A, 1), (0x2011, 7)] {
+            for len in [size - 1, size + 1] {
+                let params = [1; 33];
+                assert_eq!(
+                    command(&mut settings, (opcode, &params[..len], &mut returned), false, false),
+                    (STATUS_INVALID_PARAMETERS, 0, None)
+                );
+            }
+        }
+        assert_eq!(settings.address.address, [0; 6]);
+        assert_eq!(settings.len, 0);
+        assert_eq!(settings.scan_len, 0);
+        assert!(!settings.filter.contains(Peer::new([1; 6], true)));
+        assert_eq!(
+            command(&mut settings, (0x200A, &[2], &mut returned), false, false),
+            (STATUS_INVALID_PARAMETERS, 0, None)
+        );
+    }
 }

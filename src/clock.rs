@@ -34,8 +34,6 @@ const CALIBRATION_INTERVAL: Duration = Duration::from_secs(4);
 const CALIBRATION_SKIPS_MAX: u8 = 1;
 /// Temperature change that requires a calibration, in units of 0.25 °C.
 const CALIBRATION_TEMP_CHANGE: u32 = 2;
-/// Polling interval while the crystal starts or a calibration runs.
-const POLL: Duration = Duration::from_micros(250);
 /// Capture register of the access address time (PPI channel 26).
 const CC_ADDRESS: usize = 1;
 /// Capture register of the packet end time (PPI channel 27).
@@ -54,6 +52,10 @@ const CALIBRATION_WAIT: Duration = Duration::from_millis(2);
 const PPI_CALIBRATE: usize = 3;
 /// Wakes the calibration when the clock interrupt reports it done.
 static CALIBRATION_DONE: AtomicWaker = AtomicWaker::new();
+/// Wakes the radio task when the high frequency crystal has started.
+static CRYSTAL_STARTED: AtomicWaker = AtomicWaker::new();
+/// Wakes the calibration task after a die temperature measurement.
+static TEMPERATURE_READY: AtomicWaker = AtomicWaker::new();
 /// Time after which the crystal is started again when it does not run.
 const CRYSTAL_RETRY_US: u32 = 2000;
 /// Time the high frequency crystal gets to start before TIMER0 restarts.
@@ -105,6 +107,63 @@ pub struct Clock<'peripherals> {
     paused: Option<(u32, u32)>,
 }
 
+/// Cancels a temperature measurement when its future completes or is dropped.
+struct TemperatureMeasurement;
+
+impl Drop for TemperatureMeasurement {
+    fn drop(&mut self) {
+        TEMP.intenclr().write(|w| w.set_datardy(true));
+        TEMP.tasks_stop().write_value(1);
+        TEMP.events_datardy().write_value(0);
+    }
+}
+
+/// Owns an in-progress clock restart until its future commits or cancels.
+struct ResumeGuard<'clock, 'peripherals> {
+    /// Borrow prevents any other clock operation until this restart finishes.
+    clock:     &'clock mut Clock<'peripherals>,
+    /// Successful restarts transfer their crystal reference to the clock.
+    finished:  bool,
+    /// Original RTC time base restored when the future is cancelled.
+    origin:    (u32, u32),
+    /// Whether this operation acquired a high frequency clock reference.
+    requested: bool,
+}
+
+impl<'clock, 'peripherals> ResumeGuard<'clock, 'peripherals> {
+    /// Commits the running clock and transfers its crystal reference.
+    fn finish(mut self) { self.finished = true; }
+
+    /// Starts a restart transaction without acquiring the crystal early.
+    const fn new(clock: &'clock mut Clock<'peripherals>, origin: (u32, u32)) -> Self {
+        Self { clock, finished: false, origin, requested: false }
+    }
+
+    /// Acquires the crystal only once the scheduled wake time is reached.
+    fn request(&mut self) {
+        request_crystal();
+        self.requested = true;
+    }
+}
+
+impl Drop for ResumeGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
+        self.clock.cancel_start();
+        REGS.tasks_stop().write_value(1);
+        REGS.tasks_clear().write_value(1);
+        RTC.events_compare(RTC_RESUME).write_value(0);
+        self.clock.paused = Some(self.origin);
+        if self.requested {
+            CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
+            release_crystal();
+        }
+    }
+}
+
 impl<'peripherals> Clock<'peripherals> {
     /// Time of the last access address the radio sent or received.
     #[inline]
@@ -145,7 +204,7 @@ impl<'peripherals> Clock<'peripherals> {
         self.paused = None;
         if !crystal_running() {
             self.late = self.late.wrapping_add(1);
-            self.wait_crystal();
+            self.wait_crystal().await;
         }
     }
 
@@ -241,16 +300,20 @@ impl<'peripherals> Clock<'peripherals> {
     pub fn receive_at(&mut self, at: u32) -> bool { self.start_at(at, PPI_RXEN) }
 
     /// Restarts TIMER0 as soon as the crystal can run.
+    ///
+    /// Dropping this future rolls back to the paused RTC time base.
     #[inline]
     pub async fn resume_now(&mut self) {
         let Some((tick, time)) = self.paused else { return };
-        request_crystal();
+        let mut restart = ResumeGuard::new(self, (tick, time));
+        restart.request();
         let elapsed = rtc_now().wrapping_sub(tick) & RTC_MASK;
         let ticks = elapsed.saturating_add(us_to_ticks(CRYSTAL_LEAD_US)).saturating_add(RTC_MIN_TICKS);
         RTC.cc(RTC_RESUME).write(|w| w.set_compare(tick.wrapping_add(ticks) & RTC_MASK));
         RTC.events_compare(RTC_RESUME).write_value(0);
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
-        self.finish_resume(tick, time, ticks).await;
+        restart.clock.finish_resume(tick, time, ticks).await;
+        restart.finish();
     }
 
     /// Waits until `at` or until `interrupt` completes, with TIMER0 and the
@@ -278,16 +341,17 @@ impl<'peripherals> Clock<'peripherals> {
             self.resume_now().await;
             return true;
         }
+        let mut restart = ResumeGuard::new(self, (tick, time));
         RTC.cc(RTC_RESUME).write(|w| w.set_compare(resume));
         RTC.events_compare(RTC_RESUME).write_value(0);
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
         let wake = ticks_to_us(ticks.wrapping_sub(elapsed)).saturating_sub(CRYSTAL_LEAD_US);
         if let Either::Second(_) = select(Timer::after_micros(u64::from(wake)), interrupt).await {
-            PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
             return false;
         }
-        request_crystal();
-        self.finish_resume(tick, time, ticks).await;
+        restart.request();
+        restart.clock.finish_resume(tick, time, ticks).await;
+        restart.finish();
         true
     }
 
@@ -307,19 +371,18 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Sleeps until the crystal runs, starting it again if it does not come
     /// up in time.
-    fn wait_crystal(&self) {
-        loop {
-            let since = self.now();
-            sleep::until(|| crystal_running() || reached(self.now(), since.wrapping_add(CRYSTAL_RETRY_US)));
-            if crystal_running() {
-                return;
+    async fn wait_crystal(&self) {
+        while !crystal_running() {
+            if with_timeout(Duration::from_micros(u64::from(CRYSTAL_RETRY_US)), crystal_started()).await.is_err() {
+                CLOCK.tasks_hfclkstart().write_value(1);
+                info!("crystal started again");
             }
-            CLOCK.tasks_hfclkstart().write_value(1);
-            info!("crystal started again");
         }
+        CLOCK.intenclr().write(|w| w.set_hfclkstarted(true));
     }
 
-    /// Busy-waits until `at`.
+    /// Busy-waits until `at` for callers that require microsecond precision.
+    /// Use [`Self::sleep_until`] outside timing-critical sections.
     #[inline]
     pub fn wait_until(&self, at: u32) { while !reached(self.now(), at) {} }
 }
@@ -328,21 +391,25 @@ impl<'peripherals> Clock<'peripherals> {
 fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 /// Keeps the low frequency RC oscillator within 500 ppm forever.
+/// Owns TEMP exclusively; the caller must enable its data-ready interrupt.
 ///
 /// As Nordic specifies it, the temperature is checked every
 /// [`CALIBRATION_INTERVAL`], and the oscillator calibrated when it changed by
 /// 0.5 °C, or at the latest every second interval.
 #[inline]
-pub async fn calibrate_rc() -> ! {
+pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {
     let mut calibrated_at = None;
     let mut skipped = 0_u8;
     loop {
         let temperature = temperature().await;
         let changed = calibrated_at.is_none_or(|last: i32| last.abs_diff(temperature) >= CALIBRATION_TEMP_CHANGE);
         if changed || skipped >= CALIBRATION_SKIPS_MAX {
-            calibrate().await;
-            calibrated_at = Some(temperature);
-            skipped = 0;
+            if calibrate().await {
+                calibrated_at = Some(temperature);
+                skipped = 0;
+            } else {
+                info!("RC calibration timed out");
+            }
         } else {
             skipped = skipped.saturating_add(1);
         }
@@ -356,7 +423,7 @@ pub async fn calibrate_rc() -> ! {
 /// wakes the task when it is done, so the CPU wakes twice. A crystal that
 /// does not start, or a start that was missed, is retried every
 /// [`CALIBRATION_WAIT`].
-async fn calibrate() {
+async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
     let channel = PPI.ch(PPI_CALIBRATE);
     channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
@@ -367,8 +434,10 @@ async fn calibrate() {
     if crystal_running() {
         CLOCK.tasks_cal().write_value(1);
     }
+    let mut completed = false;
     for _ in 0..CALIBRATION_WAITS_MAX {
         if with_timeout(CALIBRATION_WAIT, calibration_done()).await.is_ok() {
+            completed = true;
             break;
         }
         if crystal_running() {
@@ -381,6 +450,7 @@ async fn calibrate() {
     CLOCK.intenclr().write(|w| w.set_done(true));
     CLOCK.events_done().write_value(0);
     release_crystal();
+    completed
 }
 
 /// Waits until the calibration is done.
@@ -396,25 +466,52 @@ async fn calibration_done() {
     .await;
 }
 
-/// Handles the clock interrupt: wakes the calibration once it is done.
+/// Waits for the crystal through the existing `CLOCK_POWER` interrupt.
+async fn crystal_started() {
+    poll_fn(|cx| {
+        CRYSTAL_STARTED.register(cx.waker());
+        if crystal_running() {
+            return Poll::Ready(());
+        }
+        CLOCK.intenset().write(|w| w.set_hfclkstarted(true));
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Handles the clock interrupt: wakes calibration and crystal startup.
 /// Call it from the `CLOCK_POWER` interrupt handler, which must be enabled.
 #[inline]
 pub fn on_clock_interrupt() {
-    CLOCK.intenclr().write(|w| w.set_done(true));
+    CLOCK.intenclr().write(|w| {
+        w.set_done(true);
+        w.set_hfclkstarted(true);
+    });
     CALIBRATION_DONE.wake();
+    CRYSTAL_STARTED.wake();
 }
 
-/// The die temperature in units of 0.25 °C.
+/// Handles TEMP data-ready; call from an enabled, lower-priority TEMP ISR.
+#[inline]
+pub fn on_temperature_interrupt() {
+    TEMP.intenclr().write(|w| w.set_datardy(true));
+    TEMPERATURE_READY.wake();
+}
+
+/// The die temperature in units of 0.25 °C, woken by the TEMP interrupt.
 async fn temperature() -> i32 {
+    let _measurement = TemperatureMeasurement;
     TEMP.events_datardy().write_value(0);
     TEMP.tasks_start().write_value(1);
-    // A measurement takes about 36 us.
-    while TEMP.events_datardy().read() == 0 {
-        Timer::after(POLL).await;
-    }
-    TEMP.events_datardy().write_value(0);
-    TEMP.tasks_stop().write_value(1);
-    TEMP.temp().read().cast_signed()
+    poll_fn(|cx| {
+        TEMPERATURE_READY.register(cx.waker());
+        if TEMP.events_datardy().read() != 0 {
+            return Poll::Ready(TEMP.temp().read().cast_signed());
+        }
+        TEMP.intenset().write(|w| w.set_datardy(true));
+        Poll::Pending
+    })
+    .await
 }
 
 /// Whether the high frequency clock runs from the crystal.

@@ -5,13 +5,13 @@
 /// Legacy advertising and filter accept list commands.
 mod legacy;
 
+pub use crate::rng::fill as random;
 use crate::{
     advertiser::legacy::Settings as LegacySettings,
     connection::FEATURES,
     crypto,
     log::info,
     pdu::{Llid, Peer, valid_connection_parameters},
-    sleep,
 };
 use bt_hci::{
     ReadHciError,
@@ -19,7 +19,6 @@ use bt_hci::{
 };
 use core::{cell::RefCell, convert::Infallible, fmt};
 use embassy_futures::select::{Either, select};
-use embassy_nrf::pac::RNG;
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
     channel::Channel,
@@ -33,9 +32,9 @@ pub const CONNECTION_HANDLE: u16 = 0;
 pub const ACL_MAX: usize = 27;
 /// ACL buffers towards the air.
 const ACL_OUT_BUFFERS: usize = 4;
-/// Largest packet to the host: the LE enhanced connection complete event,
-/// one byte longer than an ACL header and one PDU payload.
-const PACKET_MAX: usize = 33;
+/// Largest host event: Command Complete with the 64-byte supported-command
+/// bitmap.
+const PACKET_MAX: usize = 70;
 /// Largest packet from the host: a command with the most parameters.
 const HOST_PACKET_MAX: usize = 259;
 
@@ -164,6 +163,7 @@ pub struct AclOut {
 }
 
 /// A packet to the host.
+#[derive(Clone, Copy)]
 pub struct Packet {
     /// Packet bytes without the packet indicator.
     bytes: [u8; PACKET_MAX],
@@ -249,19 +249,34 @@ impl Packet {
         params: ConnectionParams,
         central_accuracy: u8,
     ) -> Self {
+        Self::connection_complete_resolved(status, (peer, local), params, central_accuracy, None)
+    }
+
+    /// Connection completion with an optional resolved peer identity.
+    #[must_use = "the packet is only built"]
+    #[inline]
+    pub fn connection_complete_resolved(
+        status: u8,
+        (peer, local): (Peer, Option<[u8; 6]>),
+        params: ConnectionParams,
+        central_accuracy: u8,
+        identity: Option<Peer>,
+    ) -> Self {
+        let rpa = identity.map_or([0; 6], |_| peer.address);
+        let reported = identity.unwrap_or(peer);
         let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
         let [l0, l1, l2, l3, l4, l5] = local.unwrap_or_default();
         let mut body = [0_u8; 30];
         let [interval_low, interval_high] = params.interval.to_le_bytes();
         let [latency_low, latency_high] = params.latency.to_le_bytes();
         let [timeout_low, timeout_high] = params.timeout.to_le_bytes();
-        let [p0, p1, p2, p3, p4, p5] = peer.address;
+        let [p0, p1, p2, p3, p4, p5] = reported.address;
         body.copy_from_slice(&[
             status,
             handle_low,
             handle_high,
             1,
-            u8::from(peer.random),
+            u8::from(reported.random) | if identity.is_some() { 2 } else { 0 },
             p0,
             p1,
             p2,
@@ -274,13 +289,12 @@ impl Packet {
             l3,
             l4,
             l5,
-            // The controller does not resolve peer addresses.
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            rpa[0],
+            rpa[1],
+            rpa[2],
+            rpa[3],
+            rpa[4],
+            rpa[5],
             interval_low,
             interval_high,
             latency_low,
@@ -342,6 +356,16 @@ impl Packet {
             &[EVENT_ENCRYPTION_CHANGE, 4, status, handle_low, handle_high, u8::from(enabled)],
             &[],
         )
+    }
+
+    /// Whether this is a retained parameter update completion.
+    pub(crate) fn is_parameter_update(&self) -> bool {
+        self.bytes.first() == Some(&EVENT_LE_META) && self.bytes.get(2) == Some(&LE_CONNECTION_UPDATE_COMPLETE)
+    }
+
+    /// Whether this is a retained PHY update completion.
+    pub(crate) fn is_phy_update(&self) -> bool {
+        self.bytes.first() == Some(&EVENT_LE_META) && self.bytes.get(2) == Some(&LE_PHY_UPDATE_COMPLETE)
     }
 
     /// An encryption key refresh complete event.
@@ -406,14 +430,41 @@ impl Packet {
     /// An LE PHY update complete event: `phy` both ways.
     #[inline]
     #[must_use = "the packet is only built"]
-    pub fn phy_update_complete(phy: u8) -> Self {
+    pub fn phy_update_complete(phy: u8) -> Self { Self::phy_update_complete_pair(phy, phy) }
+
+    /// Reports separate receive and transmit PHYs to the host.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn phy_update_complete_pair(rx: u8, tx: u8) -> Self { Self::phy_update_result(STATUS_SUCCESS, rx, tx) }
+
+    /// Reports success or failure of a host PHY procedure.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn phy_update_result(status: u8, rx: u8, tx: u8) -> Self {
         let [handle_low, handle_high] = CONNECTION_HANDLE.to_le_bytes();
         Self::build(
             PacketKind::Event,
-            &[EVENT_LE_META, 6, LE_PHY_UPDATE_COMPLETE, STATUS_SUCCESS, handle_low, handle_high, phy, phy],
+            &[EVENT_LE_META, 6, LE_PHY_UPDATE_COMPLETE, status, handle_low, handle_high, tx, rx],
             &[],
         )
     }
+
+    /// Completion of the host's remote feature query.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn remote_features(features: [u8; 8]) -> Self { Self::remote_features_result(0, features) }
+
+    /// Completion or rejection of a remote feature query.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn remote_features_result(status: u8, features: [u8; 8]) -> Self {
+        Self::build(PacketKind::Event, &[EVENT_LE_META, 12, 4, status, 0, 0], &features)
+    }
+
+    /// Completion of the host's remote version query.
+    #[inline]
+    #[must_use = "the packet is only built"]
+    pub fn remote_version(version: [u8; 5]) -> Self { Self::build(PacketKind::Event, &[12, 8, 0, 0, 0], &version) }
 }
 
 /// Connection parameters in link layer units.
@@ -437,6 +488,8 @@ impl ConnectionParams {
 
 /// Host state kept by the controller.
 struct HostState {
+    /// Host query opcodes already accepted but not completed.
+    active_queries:    u8,
     /// Whether a connection exists.
     connected:         bool,
     /// Changes at each link boundary so blocked sends cannot cross sessions.
@@ -451,18 +504,23 @@ struct HostState {
     legacy:            LegacySettings,
     /// Whether the host enabled legacy advertising.
     legacy_enabled:    bool,
-    /// Own identity resolving key from the resolving list, for resolvable
-    /// private addresses.
-    local_irk:         Option<[u8; 16]>,
     /// A key reply is accepted only after an LTK request was queued.
     ltk_pending:       bool,
     /// Authenticated payload timeout in units of 10 ms.
     payload_timeout:   u16,
+    /// Accepted host PHY request, published after Command Status.
+    phy_pending:       Option<[u8; 2]>,
+    /// Current receive and transmit PHY, updated at the instant.
+    phys:              [u8; 2],
+    /// Default transmit and receive PHY preferences.
+    preferred_phys:    [u8; 2],
     /// The last resolvable private address, the key it was made with and
     /// when it expires. Advertising keeps it until then.
     private_address:   Option<(Peer, [u8; 16], Instant)>,
     /// Lifetime of a resolvable private address.
     private_timeout:   Duration,
+    /// Host requests waiting for the link layer (features and version).
+    queries:           u8,
     /// First byte of the central's features, zero until known.
     remote_features:   u8,
 }
@@ -504,10 +562,6 @@ impl HostState {
 
     /// Overwrites every identity resolving key before it is dropped.
     fn forget_keys(&mut self) {
-        if let Some(key) = self.local_irk.as_mut() {
-            crypto::wipe(key);
-        }
-        self.local_irk = None;
         if let Some(&mut (_, ref mut key, _)) = self.private_address.as_mut() {
             crypto::wipe(key);
         }
@@ -520,13 +574,17 @@ impl HostState {
     const fn new(connected: bool, epoch: u32) -> Self {
         Self {
             connected,
+            queries: 0,
+            active_queries: 0,
+            phys: [1, 1],
+            preferred_phys: [2, 2],
+            phy_pending: None,
             epoch,
             event_mask: EVENT_MASK_DEFAULT,
             event_mask_page_2: 0,
             le_event_mask: LE_EVENT_MASK_DEFAULT,
             legacy: LegacySettings::new(),
             legacy_enabled: false,
-            local_irk: None,
             ltk_pending: false,
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             private_address: None,
@@ -538,7 +596,7 @@ impl HostState {
 
 /// State shared between the host interface and the link layer.
 pub struct Shared {
-    /// ACL data received from the air for the host.
+    /// ACL data received from the air.
     acl_in:        Channel<CriticalSectionRawMutex, Packet, 2>,
     /// ACL data from the host for the air.
     acl_out:       Channel<CriticalSectionRawMutex, AclOut, ACL_OUT_BUFFERS>,
@@ -553,6 +611,11 @@ pub struct Shared {
     /// Connection parameters the host asks the central for: interval range,
     /// latency and supervision timeout in link layer units.
     param_request: Signal<CriticalSectionRawMutex, [u16; 4]>,
+    /// ACL data received from the air for the host.
+    /// Reset handshake with the radio executor.
+    reset:         Signal<CriticalSectionRawMutex, ()>,
+    /// Radio reset completion.
+    reset_done:    Signal<CriticalSectionRawMutex, ()>,
     /// Host state.
     state:         Mutex<CriticalSectionRawMutex, RefCell<HostState>>,
     /// Something for the connection arrived from the host.
@@ -580,6 +643,21 @@ impl Shared {
     #[inline]
     pub async fn changed(&self) { self.changed.wait().await; }
 
+    /// Releases a host query slot once its result is retained for delivery.
+    pub(crate) fn complete_query(&self, bit: u8) { self.state.lock(|cell| cell.borrow_mut().active_queries &= !bit); }
+
+    /// Completes reset only after the radio has stopped and wiped link keys.
+    pub(crate) fn complete_reset(&self) {
+        self.set_connected(false);
+        self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            state.forget_keys();
+            *state = HostState::new(false, state.epoch.wrapping_add(1));
+        });
+        while self.events.try_receive().is_ok() {}
+        self.reset_done.signal(());
+    }
+
     /// Whether ACL data from the host waits for the air.
     #[inline]
     #[must_use = "the state is only read"]
@@ -595,6 +673,8 @@ impl Shared {
     #[must_use = "the state is only created"]
     pub const fn new() -> Self {
         Self {
+            reset:         Signal::new(),
+            reset_done:    Signal::new(),
             acl_in:        Channel::new(),
             acl_out:       Channel::new(),
             changed:       Signal::new(),
@@ -633,7 +713,11 @@ impl Shared {
         let (configured_key, fallback, lifetime) = self.state.lock(|cell| {
             let state = cell.borrow();
             (
-                override_key.or(state.local_irk).filter(|_| state.legacy.private),
+                override_key
+                    .or_else(|| {
+                        state.legacy.resolving.local_key(state.legacy.kind.is_directed().then_some(state.legacy.peer))
+                    })
+                    .filter(|_| state.legacy.private),
                 state.legacy.address,
                 state.private_timeout,
             )
@@ -659,6 +743,9 @@ impl Shared {
         self.state.lock(|cell| u32::from(cell.borrow().payload_timeout).saturating_mul(10_000))
     }
 
+    /// Default PHY preference for new connections.
+    pub(crate) fn preferred_phys(&self) -> [u8; 2] { self.state.lock(|cell| cell.borrow().preferred_phys) }
+
     /// Passes received ACL data to the host. Returns false if there is no
     /// room.
     #[inline]
@@ -681,7 +768,7 @@ impl Shared {
     pub fn refresh_private_address(&self) {
         let private = self.state.lock(|cell| {
             let state = cell.borrow();
-            state.legacy_enabled && state.legacy.private && state.local_irk.is_some()
+            state.legacy_enabled && state.legacy.private && state.legacy.resolving.local_key(None).is_some()
         });
         if !private {
             return;
@@ -717,6 +804,18 @@ impl Shared {
         })
     }
 
+    /// Queues a connection parameter request as the host's LE Connection
+    /// Update does.
+    #[cfg(test)]
+    pub(crate) fn request_params(&self, params: [u16; 4]) { self.param_request.signal(params); }
+
+    /// Queues host information queries in state-machine regression tests.
+    #[cfg(test)]
+    pub(crate) fn request_queries(&self, bits: u8) { self.state.lock(|cell| cell.borrow_mut().queries |= bits); }
+
+    /// Waits for reset even when radio cleanup is blocked by host backpressure.
+    pub(crate) async fn reset_requested(&self) { self.reset.wait().await; }
+
     /// Forgets earlier wakeups.
     #[inline]
     pub fn reset_wakeup(&self) { self.wakeup.reset(); }
@@ -731,6 +830,10 @@ impl Shared {
                 state.epoch = state.epoch.wrapping_add(1);
                 state.ltk_pending = false;
                 state.remote_features = 0;
+                state.queries = 0;
+                state.active_queries = 0;
+                state.phys = [1, 1];
+                state.phy_pending = None;
             }
             state.connected = connected;
             if connected {
@@ -747,11 +850,22 @@ impl Shared {
         }
     }
 
+    /// Publishes the current receive and transmit PHY for HCI Read PHY.
+    pub(crate) fn set_phys(&self, rx: u8, tx: u8) { self.state.lock(|cell| cell.borrow_mut().phys = [rx, tx]); }
+
     /// Records the first feature byte of the central, which decides whether
     /// the connection parameters request procedure can be used.
     #[inline]
     pub fn set_remote_features(&self, features: u8) {
         self.state.lock(|cell| cell.borrow_mut().remote_features = features);
+    }
+
+    /// Wakes the controller for a reset, including waits under host
+    /// backpressure.
+    pub(crate) fn signal_reset(&self) {
+        self.reset.signal(());
+        self.changed.signal(());
+        self.wakeup.signal(());
     }
 
     /// Ends advertising that ran out of time.
@@ -775,6 +889,28 @@ impl Shared {
     #[inline]
     pub fn take_param_request(&self) -> Option<[u16; 4]> { self.param_request.try_take() }
 
+    /// Takes a host-requested transmit and receive PHY preference.
+    pub(crate) fn take_phy_request(&self) -> Option<[u8; 2]> {
+        self.state.lock(|cell| cell.borrow_mut().phy_pending.take())
+    }
+
+    /// Collects accepted host queries after their command status was queued.
+    pub(crate) fn take_queries(&self) -> u8 { self.state.lock(|cell| core::mem::take(&mut cell.borrow_mut().queries)) }
+
+    /// Takes a pending host reset at a radio-safe boundary.
+    pub(crate) fn take_reset(&self) -> bool { self.reset.try_take().is_some() }
+
+    /// Queues an event for the host. Returns false if there is no room; an
+    /// event the host masked counts as delivered.
+    #[inline]
+    pub fn try_push_event(&self, packet: Packet) -> bool {
+        self.state.lock(|cell| cell.borrow().deliver(packet)).is_none_or(|event| self.events.try_send(event).is_ok())
+    }
+
+    /// Waits until the host passes something to the connection.
+    #[inline]
+    pub async fn wakeup(&self) { self.wakeup.wait().await; }
+
     /// Shared state whose host enabled every event, as TrouBLE enables all
     /// the events this controller sends.
     #[cfg(test)]
@@ -788,22 +924,6 @@ impl Shared {
         });
         shared
     }
-
-    /// Queues a connection parameter request as the host's LE Connection
-    /// Update does.
-    #[cfg(test)]
-    pub(crate) fn request_params(&self, params: [u16; 4]) { self.param_request.signal(params); }
-
-    /// Queues an event for the host. Returns false if there is no room; an
-    /// event the host masked counts as delivered.
-    #[inline]
-    pub fn try_push_event(&self, packet: Packet) -> bool {
-        self.state.lock(|cell| cell.borrow().deliver(packet)).is_none_or(|event| self.events.try_send(event).is_ok())
-    }
-
-    /// Waits until the host passes something to the connection.
-    #[inline]
-    pub async fn wakeup(&self) { self.wakeup.wait().await; }
 }
 
 /// The host side of the controller.
@@ -852,6 +972,45 @@ impl<'shared> Hci<'shared> {
             return Err(TransportError);
         }
         let opcode = u16::from_le_bytes([op_low, op_high]);
+        if opcode == 0x0C03 && params.is_empty() {
+            self.shared.reset_done.reset();
+            self.shared.signal_reset();
+            self.shared.reset_done.wait().await;
+            self.shared.events.send(Packet::command_complete(opcode, STATUS_SUCCESS, &[])).await;
+            return Ok(());
+        }
+        if opcode == 0x1002 && params.is_empty() {
+            let mut supported = [0_u8; 64];
+            for (octet, bits) in [
+                (0, 0x20),
+                (2, 0x80),
+                (5, 0xC0),
+                (10, 0x60),
+                (14, 0x28),
+                (15, 0x02),
+                (22, 0x04),
+                (25, 0xF7),
+                (26, 0xC3),
+                (27, 0xA7),
+                (28, 0x0E),
+                (32, 0x30),
+                (34, 0x38),
+                (35, 0x76),
+                (39, 0x04),
+            ] {
+                if let Some(byte) = supported.get_mut(octet) {
+                    *byte = bits;
+                }
+            }
+            self.shared.events.send(Packet::command_complete(opcode, STATUS_SUCCESS, &supported)).await;
+            return Ok(());
+        }
+        if opcode == 0x2018 && params.is_empty() {
+            let mut returned = [0; 8];
+            crate::rng::fill_async(&mut returned).await;
+            self.shared.events.send(Packet::command_complete(opcode, STATUS_SUCCESS, &returned)).await;
+            return Ok(());
+        }
         let event = if ASYNC_COMMANDS.contains(&opcode) {
             Packet::command_status(opcode, self.command_async(opcode, params))
         } else {
@@ -860,6 +1019,17 @@ impl<'shared> Hci<'shared> {
             Packet::command_complete(opcode, status, returned.get(..len).unwrap_or_default())
         };
         self.shared.events.send(event).await;
+        if event.bytes.get(2) == Some(&STATUS_SUCCESS) && matches!(opcode, 0x041D | 0x2016) {
+            self.shared.state.lock(|cell| cell.borrow_mut().queries |= if opcode == 0x2016 { 1 } else { 2 });
+            self.shared.wakeup.signal(());
+        }
+        if opcode == 0x2032
+            && event.bytes.get(2) == Some(&STATUS_SUCCESS)
+            && let Some(preferences) = params.get(2..5).and_then(phy_preferences)
+        {
+            self.shared.state.lock(|cell| cell.borrow_mut().phy_pending = Some(preferences));
+            self.shared.wakeup.signal(());
+        }
         Ok(())
     }
 
@@ -867,6 +1037,44 @@ impl<'shared> Hci<'shared> {
     fn command_async(&self, opcode: u16, params: &[u8]) -> u8 {
         if opcode == 0x2013 {
             return self.connection_update(params);
+        }
+        if matches!(opcode, 0x041D | 0x2016) {
+            if params.len() != 2 {
+                return STATUS_INVALID_PARAMETERS;
+            }
+            return self.shared.state.lock(|cell| {
+                let mut state = cell.borrow_mut();
+                let bit = if opcode == 0x2016 { 1 } else { 2 };
+                if !state.connected || params != CONNECTION_HANDLE.to_le_bytes() {
+                    STATUS_UNKNOWN_CONNECTION
+                } else if state.active_queries & bit != 0 {
+                    STATUS_DISALLOWED
+                } else {
+                    state.active_queries |= bit;
+                    STATUS_SUCCESS
+                }
+            });
+        }
+        if opcode == 0x2032 {
+            if params.len() != 7
+                || params.get(2..5).and_then(phy_preferences).is_none()
+                || params
+                    .get(5..7)
+                    .is_none_or(|bytes| bytes.first().is_none_or(|&option| option > 2) || bytes.last() != Some(&0))
+            {
+                return STATUS_INVALID_PARAMETERS;
+            }
+            return self.shared.state.lock(|cell| {
+                let mut state = cell.borrow_mut();
+                if !state.connected || params.get(..2) != Some(CONNECTION_HANDLE.to_le_bytes().as_slice()) {
+                    STATUS_UNKNOWN_CONNECTION
+                } else if state.active_queries & 4 != 0 {
+                    STATUS_DISALLOWED
+                } else {
+                    state.active_queries |= 4;
+                    STATUS_SUCCESS
+                }
+            });
         }
         if opcode != 0x0406 {
             info!("unsupported command {=u16:#06x}", opcode);
@@ -890,28 +1098,33 @@ impl<'shared> Hci<'shared> {
     /// Runs a command answered with a command complete. Returns the status
     /// and the length of the return parameters written to `returned`.
     fn command_sync(&self, opcode: u16, params: &[u8], returned: &mut [u8; 8]) -> (u8, usize) {
+        if matches!(opcode, 0x1001 | 0x1002 | 0x1003 | 0x1009 | 0x2002 | 0x2003 | 0x2018 | 0x201C) && !params.is_empty()
+        {
+            return (STATUS_INVALID_PARAMETERS, 0);
+        }
         match opcode {
+            0x1001 | 0x1003 | 0x1009 | 0x201C | 0x2030 => self.information_command(opcode, params, returned),
             // Peer addresses in the resolving list are resolved whenever it
             // holds their key, so enabling resolution changes nothing.
-            0x0C31 | 0x0C33 | 0x202D | 0x204E => (STATUS_SUCCESS, 0),
+            0x0C31 => {
+                if params == [0] {
+                    (STATUS_SUCCESS, 0)
+                } else {
+                    (STATUS_UNSUPPORTED, 0)
+                }
+            },
+            0x0C33 => (if params.len() == 7 { STATUS_SUCCESS } else { STATUS_INVALID_PARAMETERS }, 0),
+            0x202D | 0x204E => (self.privacy_command(opcode, params), 0),
             0x0C01 | 0x0C63 | 0x2001 => (self.event_mask_command(opcode, params), 0),
             0x202E => (self.private_timeout_command(params), 0),
             0x0C7B | 0x0C7C => self.payload_timeout_command(opcode, params, returned),
             0x2027..=0x2029 => (self.resolving_command(opcode, params), 0),
-            0x0C03 => {
-                // Everything the host configured goes, the keys of the
-                // resolving list included; the link itself is kept.
-                self.shared.state.lock(|cell| {
-                    let mut state = cell.borrow_mut();
-                    state.forget_keys();
-                    let (connected, epoch, ltk_pending, remote_features) =
-                        (state.connected, state.epoch, state.ltk_pending, state.remote_features);
-                    *state = HostState { ltk_pending, remote_features, ..HostState::new(connected, epoch) };
-                });
-                self.shared.changed.signal(());
+            0x0C03 => (STATUS_INVALID_PARAMETERS, 0),
+            0x2031 => {
+                let Some(preferences) = phy_preferences(params) else { return (STATUS_INVALID_PARAMETERS, 0) };
+                self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = preferences);
                 (STATUS_SUCCESS, 0)
             },
-            0x1009 => (STATUS_SUCCESS, 6),
             0x2002 => {
                 let [len_low, len_high] = u16::try_from(ACL_MAX).unwrap_or_default().to_le_bytes();
                 returned.get_mut(..3).map_or((STATUS_SUCCESS, 0), |target| {
@@ -926,10 +1139,7 @@ impl<'shared> Hci<'shared> {
                 (STATUS_SUCCESS, 8)
             },
             0x2005..=0x200A | 0x200F..=0x2012 => self.advertising_command(opcode, params, returned),
-            0x2018 => {
-                random(returned);
-                (STATUS_SUCCESS, 8)
-            },
+
             0x201A | 0x201B => {
                 let expected = if opcode == 0x201A { 18 } else { 2 };
                 if params.len() != expected {
@@ -1012,6 +1222,53 @@ impl<'shared> Hci<'shared> {
         STATUS_SUCCESS
     }
 
+    /// Answers controller identity and capability queries.
+    fn information_command(&self, opcode: u16, params: &[u8], returned: &mut [u8; 8]) -> (u8, usize) {
+        match opcode {
+            0x1001 if params.is_empty() => {
+                returned.copy_from_slice(&[0x0B, 0, 0, 0x0B, 0xFF, 0xFF, 0, 0]);
+                (STATUS_SUCCESS, 8)
+            },
+            0x1003 if params.is_empty() => {
+                returned[4] = 0x60; // LE supported, BR/EDR not supported.
+                (STATUS_SUCCESS, 8)
+            },
+            0x1009 if params.is_empty() => {
+                use embassy_nrf::pac::{FICR, ficr::vals::Deviceaddrtype};
+                // Never present a factory random address as a public identity.
+                // LE-only controllers without a public address return zero.
+                if FICR.deviceaddrtype().read().deviceaddrtype() == Deviceaddrtype::Public {
+                    let low = FICR.deviceaddr(0).read().to_le_bytes();
+                    let high = FICR.deviceaddr(1).read().to_le_bytes();
+                    returned[..4].copy_from_slice(&low);
+                    returned[4..6].copy_from_slice(&high[..2]);
+                }
+                (STATUS_SUCCESS, 6)
+            },
+            0x2030 => {
+                if params.len() != 2 {
+                    return (STATUS_INVALID_PARAMETERS, 0);
+                }
+                self.shared.state.lock(|cell| {
+                    let state = cell.borrow();
+                    if !state.connected || params != CONNECTION_HANDLE.to_le_bytes() {
+                        return (STATUS_UNKNOWN_CONNECTION, 0);
+                    }
+                    let [rx, tx] = state.phys;
+                    returned[..4].copy_from_slice(&[0, 0, tx, rx]);
+                    (STATUS_SUCCESS, 4)
+                })
+            },
+            0x201C if params.is_empty() => {
+                // Standalone legacy advertising states and peripheral
+                // connection.
+                returned[..2].copy_from_slice(&[0x8F, 0]);
+                (STATUS_SUCCESS, 8)
+            },
+            _ => (STATUS_INVALID_PARAMETERS, 0),
+        }
+    }
+
     /// Creates the host interface.
     #[inline]
     #[must_use = "the interface is only created"]
@@ -1026,6 +1283,9 @@ impl<'shared> Hci<'shared> {
             return (STATUS_INVALID_PARAMETERS, 0);
         };
         if u16::from_le_bytes([handle0, handle1]) != CONNECTION_HANDLE {
+            return (STATUS_UNKNOWN_CONNECTION, 0);
+        }
+        if !self.shared.state.lock(|cell| cell.borrow().connected) {
             return (STATUS_UNKNOWN_CONNECTION, 0);
         }
         let timeout = params.get(2..4).and_then(<[u8]>::first_chunk::<2>).map(|&bytes| u16::from_le_bytes(bytes));
@@ -1048,6 +1308,38 @@ impl<'shared> Hci<'shared> {
         (STATUS_SUCCESS, len)
     }
 
+    /// Applies address resolution enable and per-peer privacy modes.
+    fn privacy_command(&self, opcode: u16, params: &[u8]) -> u8 {
+        self.shared.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            if state.legacy_enabled {
+                return STATUS_DISALLOWED;
+            }
+            if opcode == 0x202D {
+                let &[enable] = params else { return STATUS_INVALID_PARAMETERS };
+                if enable > 1 {
+                    return STATUS_INVALID_PARAMETERS;
+                }
+                state.legacy.resolution_enabled = enable == 1;
+            } else {
+                let &[kind, addr0, addr1, addr2, addr3, addr4, addr5, mode] = params else {
+                    return STATUS_INVALID_PARAMETERS;
+                };
+                if kind > 1 || mode > 1 {
+                    return STATUS_INVALID_PARAMETERS;
+                }
+                if !state
+                    .legacy
+                    .resolving
+                    .set_mode(Peer::new([addr0, addr1, addr2, addr3, addr4, addr5], kind == 1), mode == 1)
+                {
+                    return STATUS_UNKNOWN_CONNECTION;
+                }
+            }
+            STATUS_SUCCESS
+        })
+    }
+
     /// Sets the lifetime of resolvable private addresses (LE Set Resolvable
     /// Private Address Timeout). The current address keeps its expiry.
     fn private_timeout_command(&self, params: &[u8]) -> u8 {
@@ -1065,6 +1357,12 @@ impl<'shared> Hci<'shared> {
     /// Runs a resolving list command: add (0x2027), remove (0x2028) or clear
     /// (0x2029). Returns the status.
     fn resolving_command(&self, opcode: u16, params: &[u8]) -> u8 {
+        if self.shared.state.lock(|cell| {
+            let state = cell.borrow();
+            state.legacy_enabled && state.legacy.resolution_enabled
+        }) {
+            return STATUS_DISALLOWED;
+        }
         match opcode {
             0x2027 => {
                 let (Some(&[peer_type, a0, a1, a2, a3, a4, a5]), Some(peer_irk), Some(local)) = (
@@ -1078,6 +1376,9 @@ impl<'shared> Hci<'shared> {
                     return STATUS_INVALID_PARAMETERS;
                 }
                 let peer = Peer::new([a0, a1, a2, a3, a4, a5], peer_type == 1);
+                if !self.shared.state.lock(|cell| cell.borrow().legacy.resolving.can_add(peer)) {
+                    return STATUS_MEMORY_FULL;
+                }
                 let needs_address = *local != [0; 16]
                     && self.shared.state.lock(|cell| {
                         let state = cell.borrow();
@@ -1087,28 +1388,38 @@ impl<'shared> Hci<'shared> {
                 let added = self.shared.state.lock(|cell| {
                     let mut state = cell.borrow_mut();
                     if *local != [0; 16] {
-                        state.local_irk = Some(*local);
                         // Advertising that started before the key arrived
                         // moves to a private address now.
                         if let Some(address) = own {
                             state.legacy.own = address;
                         }
                     }
-                    *peer_irk == [0; 16] || state.legacy.resolving.add(peer, *peer_irk)
+                    state.legacy.resolving.add_keys(peer, *peer_irk, *local)
                 });
                 if added { STATUS_SUCCESS } else { STATUS_MEMORY_FULL }
             },
             0x2028 => {
-                let Some(&[peer_type, a0, a1, a2, a3, a4, a5]) =
-                    params.first_chunk::<7>().filter(|_| params.len() == 7)
+                let Some(&[peer_type, a0, a1, a2, a3, a4, a5]) = params
+                    .first_chunk::<7>()
+                    .filter(|_| params.len() == 7 && params.first().is_some_and(|&kind| kind <= 1))
                 else {
                     return STATUS_INVALID_PARAMETERS;
                 };
                 let peer = Peer::new([a0, a1, a2, a3, a4, a5], peer_type == 1);
-                self.shared.state.lock(|cell| cell.borrow_mut().legacy.resolving.remove(peer));
+                self.shared.state.lock(|cell| {
+                    let mut state = cell.borrow_mut();
+                    state.legacy.resolving.remove(peer);
+                    if let Some(&mut (_, ref mut key, _)) = state.private_address.as_mut() {
+                        crypto::wipe(key);
+                    }
+                    state.private_address = None;
+                });
                 STATUS_SUCCESS
             },
             _ => {
+                if !params.is_empty() {
+                    return STATUS_INVALID_PARAMETERS;
+                }
                 self.shared.state.lock(|cell| {
                     cell.borrow_mut().forget_keys();
                 });
@@ -1195,54 +1506,19 @@ impl Transport for Hci<'_> {
     }
 }
 
+/// Validates the common `All_PHYs`, `TX_PHYs` and `RX_PHYs` fields.
+fn phy_preferences(params: &[u8]) -> Option<[u8; 2]> {
+    let &[all, tx, rx] = params else { return None };
+    if all > 3 {
+        return None;
+    }
+    let transmit = if all & 1 != 0 { 3 } else { tx };
+    let receive = if all & 2 != 0 { 3 } else { rx };
+    ((1..=3).contains(&transmit) && (1..=3).contains(&receive)).then_some([transmit, receive])
+}
+
 /// Whether `bit` is set in an event mask.
 fn mask_bit(mask: u64, bit: u8) -> bool { bit < 64 && mask & 1_u64.wrapping_shl(u32::from(bit)) != 0 }
-
-/// Fills `bytes` from the hardware random number generator.
-#[inline]
-pub fn random(bytes: &mut [u8]) {
-    // Serialize register transactions, not entropy collection. Keep RNG
-    // running until both thread and preempting link-layer callers finish.
-    static RNG_LOCK: Mutex<CriticalSectionRawMutex, RefCell<u8>> = Mutex::new(RefCell::new(0));
-    RNG_LOCK.lock(|cell| {
-        let mut users = cell.borrow_mut();
-        *users = users.saturating_add(1);
-        if *users != 1 {
-            return;
-        }
-        RNG.config().write(|w| w.set_dercen(true));
-        RNG.events_valrdy().write_value(0);
-        RNG.intenset().write(|w| w.set_valrdy(true));
-        RNG.tasks_start().write_value(1);
-    });
-    for byte in bytes {
-        loop {
-            let sampled = RNG_LOCK.lock(|_| {
-                if RNG.events_valrdy().read() == 0 {
-                    return None;
-                }
-                let value = RNG.value().read().value();
-                RNG.events_valrdy().write_value(0);
-                Some(value)
-            });
-            if let Some(value) = sampled {
-                *byte = value;
-                break;
-            }
-            // Interrupts remain enabled while waiting. A preempting caller
-            // may consume a byte, but cannot stop RNG while we still need it.
-            sleep::until(|| RNG.events_valrdy().read() != 0);
-        }
-    }
-    RNG_LOCK.lock(|cell| {
-        let mut users = cell.borrow_mut();
-        *users = users.saturating_sub(1);
-        if *users == 0 {
-            RNG.tasks_stop().write_value(1);
-            RNG.intenclr().write(|w| w.set_valrdy(true));
-        }
-    });
-}
 
 #[cfg(test)]
 mod tests {
@@ -1252,6 +1528,105 @@ mod tests {
         pin::pin,
         task::{Context, Poll, Waker},
     };
+
+    #[test]
+    fn reset_waits_for_radio_shutdown_and_clears_old_queues() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        assert!(shared.try_push_event(Packet::completed_packets(2)));
+        let hci = Hci::new(&shared);
+        let mut reset = pin!(hci.command(&[3, 12, 0]));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(reset.as_mut().poll(&mut context).is_pending());
+        assert!(shared.state.lock(|cell| cell.borrow().connected));
+        assert!(shared.take_reset());
+        shared.complete_reset();
+        assert!(reset.as_mut().poll(&mut context).is_ready());
+        let event = shared.events.try_receive().unwrap();
+        assert_eq!(&event.bytes[..6], &[14, 4, 1, 3, 12, 0]);
+        assert!(shared.events.try_receive().is_err());
+        assert!(!shared.state.lock(|cell| cell.borrow().connected));
+    }
+
+    #[test]
+    fn privacy_enable_mode_and_list_changes_are_enforced() {
+        let shared = Shared::new();
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        let mut add = [0; 39];
+        add[0] = 1;
+        add[1..7].copy_from_slice(&[1; 6]);
+        assert_eq!(hci.command_sync(0x2027, &add, &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(hci.command_sync(0x204E, &[1, 1, 1, 1, 1, 1, 1, 1], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(hci.command_sync(0x202D, &[1], &mut returned).0, STATUS_SUCCESS);
+        shared.state.lock(|cell| cell.borrow_mut().legacy_enabled = true);
+        assert_eq!(hci.command_sync(0x2029, &[], &mut returned).0, STATUS_DISALLOWED);
+        assert_eq!(hci.command_sync(0x202D, &[0], &mut returned).0, STATUS_DISALLOWED);
+        shared.state.lock(|cell| cell.borrow_mut().legacy_enabled = false);
+        assert_eq!(hci.command_sync(0x202D, &[2], &mut returned).0, STATUS_INVALID_PARAMETERS);
+        assert_eq!(hci.command_sync(0x202D, &[0], &mut returned).0, STATUS_SUCCESS);
+        assert!(!shared.state.lock(|cell| cell.borrow().legacy.resolution_enabled));
+    }
+
+    #[test]
+    fn resolved_connection_event_reports_identity_and_peer_rpa() {
+        let on_air = Peer::new([1, 2, 3, 4, 5, 0x40], true);
+        let identity = Peer::new([6; 6], false);
+        let packet = Packet::connection_complete_resolved(
+            0,
+            (on_air, Some([7; 6])),
+            ConnectionParams::new(12, 0, 600),
+            0,
+            Some(identity),
+        );
+        assert_eq!(packet.bytes[7], 2);
+        assert_eq!(&packet.bytes[8..14], &identity.address);
+        assert_eq!(&packet.bytes[20..26], &on_air.address);
+    }
+
+    #[test]
+    fn supported_commands_fit_and_do_not_claim_scanning_or_central_role() {
+        let shared = Shared::new();
+        let hci = Hci::new(&shared);
+        assert!(run(hci.command(&[2, 16, 0])).is_ok());
+        let packet = shared.events.try_receive().unwrap();
+        assert_eq!(packet.len, 70);
+        assert_eq!(packet.bytes[1], 68);
+        assert_eq!(packet.bytes[6 + 26] & 0x3C, 0);
+        assert_ne!(packet.bytes[6 + 5] & 0x80, 0);
+    }
+
+    #[test]
+    fn host_phy_command_validates_and_publishes_only_after_status() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let hci = Hci::new(&shared);
+        assert!(run(hci.command(&[0x32, 0x20, 7, 0, 0, 0, 1, 2, 0, 0])).is_ok());
+        let status = shared.events.try_receive().unwrap();
+        assert_eq!(&status.bytes[..6], &[15, 4, 0, 1, 0x32, 0x20]);
+        assert_eq!(shared.take_phy_request(), Some([1, 2]));
+        assert_eq!(hci.command_async(0x2032, &[0, 0, 0, 1, 2, 0, 0]), STATUS_DISALLOWED);
+        shared.complete_query(4);
+        assert_eq!(hci.command_async(0x2032, &[0, 0, 0, 4, 2, 0, 0]), STATUS_INVALID_PARAMETERS);
+        let mut returned = [0; 8];
+        assert_eq!(hci.command_sync(0x2031, &[3, 0, 0], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.preferred_phys(), [3, 3]);
+    }
+
+    #[test]
+    fn authenticated_timeout_commands_require_a_live_connection() {
+        let shared = Shared::new();
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        assert_eq!(hci.command_sync(0x0C7B, &[0, 0], &mut returned).0, STATUS_UNKNOWN_CONNECTION);
+        assert_eq!(hci.command_sync(0x0C7C, &[0, 0, 100, 0], &mut returned).0, STATUS_UNKNOWN_CONNECTION);
+        assert_eq!(shared.payload_timeout(), u32::from(DEFAULT_PAYLOAD_TIMEOUT) * 10_000);
+        shared.set_connected(true);
+        assert_eq!(hci.command_sync(0x0C7C, &[0, 0, 100, 0], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.payload_timeout(), 1_000_000);
+        assert_eq!(hci.command_sync(0x0C7B, &[0, 0], &mut returned), (STATUS_SUCCESS, 4));
+        assert_eq!(&returned[..4], &[0, 0, 100, 0]);
+    }
 
     fn run<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
@@ -1379,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_forgets_keys_and_settings_but_keeps_the_link() {
+    fn reset_forgets_keys_settings_and_the_link() {
         let shared = Shared::new();
         shared.set_connected(true);
         let hci = Hci::new(&shared);
@@ -1393,15 +1768,14 @@ mod tests {
         assert_eq!(hci.command_sync(0x0C7C, &[0, 0, 100, 0], &mut returned).0, STATUS_SUCCESS);
         assert_eq!(hci.command_sync(0x202E, &[60, 0], &mut returned).0, STATUS_SUCCESS);
         let epoch = shared.state.lock(|cell| cell.borrow().epoch);
-        assert_eq!(hci.command_sync(0x0C03, &[], &mut returned).0, STATUS_SUCCESS);
+        shared.complete_reset();
         shared.state.lock(|cell| {
             let state = cell.borrow();
-            assert!(state.local_irk.is_none());
             assert!(state.legacy.resolving.is_empty());
             assert_eq!(state.payload_timeout, DEFAULT_PAYLOAD_TIMEOUT);
             assert_eq!(state.private_timeout, PRIVATE_ADDRESS_TIMEOUT);
-            assert!(state.connected);
-            assert_eq!(state.epoch, epoch);
+            assert!(!state.connected);
+            assert_ne!(state.epoch, epoch);
         });
     }
 

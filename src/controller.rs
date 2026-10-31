@@ -35,7 +35,12 @@ async fn check_limits(settings: &Settings, since: &mut Option<Instant>, shared: 
     }
     *since = None;
     shared.stop_advertising();
-    shared.push_event(Packet::advertising_timeout()).await;
+    if matches!(
+        select(shared.push_event(Packet::advertising_timeout()), shared.reset_requested()).await,
+        embassy_futures::select::Either::Second(())
+    ) {
+        shared.signal_reset();
+    }
     true
 }
 
@@ -58,6 +63,11 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         crate::health::checkpoint(15);
         crate::maintenance::service(clock, radio).await;
         crate::health::checkpoint(15);
+        if shared.take_reset() {
+            radio.disable();
+            clock.pause();
+            shared.complete_reset();
+        }
         shared.refresh_private_address();
         let Some(settings) = shared.advertising() else {
             since = None;
@@ -71,8 +81,9 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         }
         clock.resume_now().await;
         let (primary, scan_response) = settings.pdus();
+        let started = clock.now();
         let Some((request, end)) = legacy::event(radio, clock, &settings, (&primary, &scan_response), &mut rx) else {
-            let next = clock.now().wrapping_add(interval(&settings));
+            let next = started.wrapping_add(interval(&settings));
             if !clock.sleep_until(next, shared.changed()).await {
                 since = None;
             }
@@ -82,30 +93,55 @@ pub async fn run(radio: &mut Radio<'_>, clock: &mut Clock<'_>, shared: &Shared) 
         radio.set_access_address(request.access_address);
         radio.set_crc_init(request.crc_init);
         let mut connection = Connection::new(&request, end);
+        connection.set_preferred_phys(shared.preferred_phys());
         let central = request.central();
         let mut shown = central.address;
         shown.reverse();
         info!("central {=[u8; 6]:02X} random {}", shown, central.random);
         let params = ConnectionParams::new(request.interval, request.latency, request.timeout);
         let local = (settings.own != settings.address).then_some(settings.own.address);
-        _ = shared.try_push_event(Packet::connection_complete(
-            STATUS_SUCCESS,
-            (request.central(), local),
-            params,
-            request.sca,
-        ));
+        connection.notify(
+            Packet::connection_complete_resolved(
+                STATUS_SUCCESS,
+                (request.central(), local),
+                params,
+                request.sca,
+                settings.resolve(request.central()),
+            ),
+            shared,
+        );
         since = None;
         let (ended, stats) = connection.run(radio, clock, &mut rx, shared).await;
         info!(
             "connection ended: {} events, {} missed, {} crc errors, {} packets",
             stats.events, stats.missed, stats.crc_errors, stats.received
         );
+        if matches!(ended, Ended::Reset) {
+            radio.disable();
+            clock.pause();
+            shared.complete_reset();
+            continue;
+        }
+        if !connection.flush_after_disconnect(shared).await {
+            radio.disable();
+            clock.pause();
+            shared.complete_reset();
+            continue;
+        }
         let reason = match ended {
             Ended::Error(code) | Ended::Terminated(code) => code,
             Ended::Local(_) => REASON_LOCAL_HOST,
             Ended::Lost => REASON_TIMEOUT,
+            Ended::Reset => continue,
         };
         shared.set_connected(false);
-        shared.push_event(Packet::disconnection_complete(reason)).await;
+        if matches!(
+            select(shared.push_event(Packet::disconnection_complete(reason)), shared.reset_requested()).await,
+            embassy_futures::select::Either::Second(())
+        ) {
+            radio.disable();
+            clock.pause();
+            shared.complete_reset();
+        }
     }
 }

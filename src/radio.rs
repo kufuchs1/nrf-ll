@@ -78,6 +78,25 @@ impl Phy {
             Self::M2 => 2,
         }
     }
+
+    /// TIMER TXEN offset from RX END for a 150-us interframe space.
+    /// nRF52832 fast-ramp and RX-chain timings match Zephyr's Nordic HAL.
+    #[must_use = "the delay is only computed"]
+    #[inline]
+    pub const fn response_offset_us(self, receive: Self) -> u32 {
+        let tx_ready_ns = match self {
+            Self::M1 => 41_050_u32,
+            Self::M2 => 40_000_u32,
+        };
+        let rx_chain_ns = match receive {
+            Self::M1 => 9400_u32,
+            Self::M2 => 5450_u32,
+        };
+        let Some(delay) = tx_ready_ns.saturating_add(rx_chain_ns).saturating_add(500).checked_div(1000) else {
+            return 0;
+        };
+        150_u32.saturating_sub(delay)
+    }
 }
 
 /// What the radio does after a packet.
@@ -115,7 +134,7 @@ impl<'peripherals> Radio<'peripherals> {
         if REGS.state().read().state() != State::Disabled {
             REGS.events_disabled().write_value(0);
             REGS.tasks_disable().write_value(1);
-            while REGS.events_disabled().read() == 0 {}
+            Self::sleep_on(|w| w.set_disabled(true), || self.is_disabled());
         }
         REGS.events_disabled().write_value(0);
         compiler_fence(Ordering::SeqCst);
@@ -226,6 +245,12 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn set_crc_init(&mut self, init: u32) { REGS.crcinit().write(|w| w.set_crcinit(init)); }
 
+    /// Selects the 40-us ramp for an explicitly timed asymmetric response.
+    #[inline]
+    pub fn set_fast_ramp(&mut self, fast: bool) {
+        REGS.modecnf0().write(|w| w.set_ru(if fast { Ru::Fast } else { Ru::Default }));
+    }
+
     /// Sets the PHY of the following packets. The radio must be disabled.
     #[inline]
     pub fn set_phy(&mut self, phy: Phy) {
@@ -329,5 +354,17 @@ const fn frequency(channel: u8) -> u8 {
         38 => 26,
         39 => 80,
         _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Phy;
+    #[test]
+    fn turnaround_offsets_match_nrf52832_hal_timing_vectors() {
+        assert_eq!(Phy::M2.response_offset_us(Phy::M1), 101);
+        assert_eq!(Phy::M1.response_offset_us(Phy::M2), 103);
+        assert_eq!(Phy::M1.response_offset_us(Phy::M1), 100);
+        assert_eq!(Phy::M2.response_offset_us(Phy::M2), 105);
     }
 }

@@ -1,6 +1,9 @@
 //! Peripheral side of a connection: connection events, acknowledgement, link
 //! encryption and the LL control procedures a central starts.
 
+/// Async, single-use encryption response entropy.
+mod entropy;
+
 /// Control procedures beyond encryption.
 mod procedures;
 
@@ -8,13 +11,15 @@ use crate::{
     channel::{Hopping, UsedChannels},
     clock::{Clock, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
-    hci::{ConnectionParams, Packet, Shared, random},
+    hci::{ConnectionParams, Packet, Shared},
     log::info,
     pdu::{BUFFER_LEN, ConnectInd, LLID_MASK, Llid, NESN, SN, field, valid_channel_map, valid_connection_parameters},
     power_control::{DEFAULT_LEVEL, LEVELS_DBM, PowerControl},
     radio::{Phy, Radio, Turnaround},
 };
 use core::future::pending;
+use embassy_futures::select::{Either, select};
+use entropy::Prefetch;
 
 /// Largest payload of a queued PDU.
 const CONTROL_PAYLOAD_MAX: usize = 27;
@@ -150,6 +155,8 @@ pub enum Ended {
     Local(u8),
     /// The supervision timeout expired.
     Lost,
+    /// The host reset the controller; no disconnection event is emitted.
+    Reset,
     /// The central terminated the connection with this error code.
     Terminated(u8),
 }
@@ -173,6 +180,13 @@ pub struct Stats {
 /// State of the encryption start procedure.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
+    /// A validated request waits for its prefetched, single-use random block.
+    AwaitingEntropy {
+        /// Central random number for the host's key lookup.
+        rand: [u8; 8],
+        /// Central encrypted diversifier for the host's key lookup.
+        ediv: [u8; 2],
+    },
     /// The host is asked for the long term key.
     AwaitingKey {
         /// Whether the key request event reached the host.
@@ -328,7 +342,7 @@ pub struct Connection {
     /// Event counter of [`Self::anchor`].
     anchor_counter:         u16,
     /// Transmit power level the central last learned.
-    announced_power:        usize,
+    announced_power:        [usize; 2],
     /// The central's features, once known.
     central_features:       Option<[u8; 8]>,
     /// Channel map update and its instant.
@@ -349,10 +363,16 @@ pub struct Connection {
     establishment_deadline: Option<u32>,
     /// Where the next packet is expected.
     expect:                 Expect,
+    /// Rejected feature query awaiting host notification.
+    feature_error:          Option<u8>,
     /// The feature exchange this side starts.
     features_request:       Request,
     /// Channel selection.
     hopping:                Hopping,
+    /// PHY preferences requested by the host until completion.
+    host_phy:               Option<[u8; 2]>,
+    /// Host queries pending completion.
+    host_queries:           u8,
     /// Connection interval in microseconds.
     interval:               u32,
     /// Time the last valid packet was received.
@@ -363,6 +383,10 @@ pub struct Connection {
     map:                    UsedChannels,
     /// Next expected sequence number.
     nesn:                   bool,
+    /// Transmit PHY to apply with the next PHY instant.
+    next_tx_phy:            Phy,
+    /// Ordered host notifications retained while its queue is full.
+    notifications:          [Option<Packet>; 3],
     /// Deadline of the host's connection parameter request, while it runs.
     param_request:          Option<u32>,
     /// Status of the host's connection parameter request to report when it
@@ -378,10 +402,16 @@ pub struct Connection {
     phy:                    Phy,
     /// The PHY update this side asks for.
     phy_request:            Request,
+    /// PHY procedure completion awaiting notification.
+    phy_status:             Option<u8>,
     /// PHY change and its instant.
     phy_update:             Option<(Phy, u16)>,
     /// Transmit power control.
-    power:                  PowerControl,
+    power:                  [PowerControl; 2],
+    /// PHY mask for which the peer has requested power control.
+    power_reporting:        u8,
+    /// PHY preference for this connection.
+    preferred_phys:         [u8; 2],
     /// Deadline of the current encryption procedure, if any.
     procedure_deadline:     Option<u32>,
     /// PDUs waiting to be sent.
@@ -414,11 +444,46 @@ pub struct Connection {
     tx:                     [u8; DATA_BUFFER_LEN],
     /// Kind of [`Self::tx`].
     tx_kind:                TxKind,
+    /// Transmit PHY, independent of the receive PHY.
+    tx_phy:                 Phy,
     /// Encrypted copy of [`Self::tx`] as sent.
     tx_sealed:              [u8; DATA_BUFFER_LEN],
+    /// Remote version, retained once our only version response is queued.
+    version:                Option<[u8; 5]>,
+    /// Version procedure state, including its response deadline.
+    version_request:        Request,
 }
 
 impl Connection {
+    /// Processes NESN independently of whether the peer retransmitted its
+    /// payload. CRC validation is done by the caller; new encrypted data also
+    /// needs its MIC.
+    fn acknowledge(&mut self, header: u8, shared: &Shared) -> Option<()> {
+        if (header & NESN != 0) == self.sn {
+            // The central did not hear our last packet. Its first packet of
+            // the connection acknowledges nothing yet.
+            if self.stats.received != 0 {
+                for_phy_mut(&mut self.power, self.tx_phy).on_loss();
+            }
+        } else {
+            self.sn = !self.sn;
+            match self.tx_kind {
+                TxKind::Acl => self.completed = self.completed.saturating_add(1),
+                TxKind::Terminate => {
+                    if let Some((reason, false)) = self.terminate {
+                        self.terminate = Some((reason, true));
+                    }
+                },
+                TxKind::Control | TxKind::Empty => {},
+            }
+            self.load_next(shared);
+            if self.abort.is_some() {
+                return None;
+            }
+        }
+        Some(())
+    }
+
     /// Applies parameter and channel map updates due at the current event.
     #[inline(never)]
     fn apply_instants(&mut self, shared: &Shared) {
@@ -433,8 +498,12 @@ impl Connection {
             && instant == self.counter
         {
             self.phy = phy;
+            self.tx_phy = self.next_tx_phy;
+            shared.set_phys(self.phy.hci(), self.tx_phy.hci());
+            self.host_phy = None;
+            shared.complete_query(4);
             self.phy_update = None;
-            _ = shared.try_push_event(Packet::phy_update_complete(phy.hci()));
+            self.notify(Packet::phy_update_complete_pair(phy.hci(), self.tx_phy.hci()), shared);
             info!("PHY now {}M", phy.hci());
         }
         if let Some(update) = self.param_update
@@ -454,7 +523,7 @@ impl Connection {
             // The host learns of updates that change something or that it
             // asked for (Core, Vol 6, Part B, 5.1.1).
             if changed || update.requested {
-                _ = shared.try_push_event(Packet::connection_update_complete(STATUS_SUCCESS, update.params));
+                self.notify(Packet::connection_update_complete(STATUS_SUCCESS, update.params), shared);
             }
             info!("connection interval now {} us", update.interval);
         }
@@ -469,12 +538,17 @@ impl Connection {
             && self.terminate.is_none()
             && self.encryption.phase == Phase::Idle
             && self.encryption_change.is_none()
+            && self.notifications.iter().all(Option::is_none)
             && !shared.has_acl_out()
     }
 
     /// Advances the encryption start procedure with the host's answer.
     #[inline(never)]
-    fn drive_encryption(&mut self, shared: &Shared) {
+    fn drive_encryption(&mut self, shared: &Shared, entropy: &Prefetch) {
+        if let Phase::AwaitingEntropy { rand, ediv } = self.encryption.phase {
+            let Some(material) = entropy.take() else { return };
+            self.finish_encryption_request(rand, ediv, &material);
+        }
         let Phase::AwaitingKey { requested, rand, ediv } = self.encryption.phase else { return };
         if !requested {
             if shared.request_ltk(rand, ediv) {
@@ -511,6 +585,13 @@ impl Connection {
             },
             None => {},
         }
+    }
+
+    /// Services host traffic before the next radio event.
+    fn drive_host(&mut self, now: u32, shared: &Shared, entropy: &Prefetch) {
+        self.drive_encryption(shared, entropy);
+        self.service_queries(now, shared);
+        self.start_procedures(now, shared);
     }
 
     /// Determines timeouts without allowing received traffic to postpone a
@@ -565,7 +646,8 @@ impl Connection {
         (enable, deadline): (u32, u32),
         shared: &Shared,
     ) -> Option<u32> {
-        radio.prepare(rx.as_mut_ptr(), Turnaround::Transmit);
+        let asymmetric = self.phy != self.tx_phy;
+        radio.prepare(rx.as_mut_ptr(), if asymmetric { Turnaround::None } else { Turnaround::Transmit });
         if self.encryption.rx_on {
             if !crypto::set_counter(&mut self.encryption.rx_config, self.encryption.rx_counter) {
                 self.abort = Some(ERROR_MIC_FAILURE);
@@ -600,8 +682,20 @@ impl Connection {
         }
         radio.wait_disabled();
         radio.set_turnaround(Turnaround::None);
+        if asymmetric {
+            radio.set_phy(self.tx_phy);
+            radio.set_fast_ramp(true);
+            if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
+                radio.set_fast_ramp(false);
+                crypto::disarm();
+                self.abort = Some(ERROR_HARDWARE_FAILURE);
+                return None;
+            }
+        }
         radio.wait_end();
+        clock.cancel_start();
         radio.wait_disabled();
+        radio.set_fast_ramp(false);
         crypto::disarm();
         Some(address)
     }
@@ -613,6 +707,54 @@ impl Connection {
         self.anchor.wrapping_add(self.interval.wrapping_mul(events))
     }
 
+    /// Consumes one complete prefetched block; no hardware RNG work runs here.
+    fn finish_encryption_request(&mut self, rand: [u8; 8], ediv: [u8; 2], material: &entropy::Material) {
+        let mut response = [0_u8; 13];
+        if let Some(code) = response.first_mut() {
+            *code = OP_ENC_RSP;
+        }
+        if let Some(own) = response.get_mut(1..) {
+            own.copy_from_slice(material.bytes());
+        }
+        let (own_skd, own_iv) = material.bytes().split_at(8);
+        if let Some(target) = self.encryption.skd.get_mut(8..) {
+            target.copy_from_slice(own_skd);
+        }
+        if let Some(target) = self.encryption.iv.get_mut(4..) {
+            target.copy_from_slice(own_iv);
+        }
+        self.enqueue(Llid::Control, &response);
+        self.encryption.phase = Phase::AwaitingKey { requested: false, rand, ediv };
+    }
+
+    /// Drains retained notifications before the final disconnection event.
+    pub(crate) async fn flush_after_disconnect(&mut self, shared: &Shared) -> bool {
+        for slot in &mut self.notifications {
+            if let Some(event) = slot.take()
+                && matches!(
+                    embassy_futures::select::select(shared.push_event(event), shared.reset_requested()).await,
+                    embassy_futures::select::Either::Second(())
+                )
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Flushes retained events in order as host capacity becomes available.
+    fn flush_notifications(&mut self, shared: &Shared) {
+        while let Some(event) = self.notifications.first().copied().flatten() {
+            if !shared.try_push_event(event) {
+                break;
+            }
+            self.notifications.rotate_left(1);
+            if let Some(last) = self.notifications.last_mut() {
+                *last = None;
+            }
+        }
+    }
+
     /// Answers a control PDU from the central.
     #[expect(clippy::rest_pattern_accessible_field, reason = "the phase is matched by variant only")]
     fn handle_control(&mut self, payload: &[u8], encrypted: bool) {
@@ -621,6 +763,7 @@ impl Connection {
         // procedure on or end the link (Core, Vol 6, Part B, 5.1.3). Any
         // other answer would be queued in front of the next step.
         let (allowed, can_answer) = match self.encryption.phase {
+            Phase::AwaitingEntropy { .. } => (code == OP_TERMINATE_IND, false),
             Phase::Starting | Phase::AwaitingStartResponse => {
                 (matches!(code, OP_START_ENC_RSP | OP_TERMINATE_IND), false)
             },
@@ -657,7 +800,8 @@ impl Connection {
                         self.abort = Some(ERROR_INVALID_PARAMETERS);
                     } else if !future_instant(self.counter, instant) {
                         self.abort = Some(ERROR_INSTANT_PASSED);
-                    } else if self.channel_update.is_some() {
+                    } else if self.channel_update.is_some() || self.param_update.is_some() || self.phy_update.is_some()
+                    {
                         self.abort = Some(ERROR_PDU_NOT_ALLOWED);
                     } else {
                         self.channel_update = Some((UsedChannels::new(map), instant));
@@ -672,12 +816,16 @@ impl Connection {
             OP_POWER_CONTROL_REQ => self.handle_power(params),
             OP_UNKNOWN_RSP | OP_REJECT_EXT_IND | OP_REJECT_IND => self.handle_rejection(code, params),
             OP_FEATURE_REQ | OP_FEATURE_RSP => self.handle_features(code, params),
-            OP_VERSION_IND => {
+            OP_VERSION_IND if self.version.is_none() => {
                 let mut response = [OP_VERSION_IND, 0, 0, 0, 0, 0];
                 if let Some(target) = response.get_mut(1..) {
                     target.copy_from_slice(&VERSION);
                 }
-                self.enqueue(Llid::Control, &response);
+                if !matches!(self.version_request, Request::Requested(_)) {
+                    self.enqueue(Llid::Control, &response);
+                }
+                self.version_request = Request::Done;
+                self.version = params.first_chunk::<5>().copied();
             },
             OP_LENGTH_REQ => {
                 let mut response = [OP_LENGTH_RSP, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -687,7 +835,8 @@ impl Connection {
                 self.enqueue(Llid::Control, &response);
             },
             OP_PING_REQ => self.enqueue(Llid::Control, &[OP_PING_RSP]),
-            OP_LENGTH_RSP | OP_PING_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {},
+            OP_VERSION_IND | OP_LENGTH_RSP | OP_PING_RSP | OP_PHY_RSP | OP_POWER_CONTROL_RSP | OP_POWER_CHANGE_IND => {
+            },
             _ => self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, code]),
         }
         info!("control {=u8:#04x}", code);
@@ -791,9 +940,10 @@ impl Connection {
             end.wrapping_add(UNIT_1250_US).wrapping_add(u32::from(request.win_offset).saturating_mul(UNIT_1250_US));
         Self {
             abort: None,
+            notifications: [None; 3],
             anchor: end,
             anchor_counter: 0,
-            announced_power: DEFAULT_LEVEL,
+            announced_power: [DEFAULT_LEVEL; 2],
             central_features: None,
             channel_update: None,
             completed: 0,
@@ -828,9 +978,12 @@ impl Connection {
             param_update: None,
             payload_timer: None,
             phy: Phy::M1,
+            tx_phy: Phy::M1,
+            next_tx_phy: Phy::M1,
             phy_request: Request::NotStarted,
             phy_update: None,
-            power: PowerControl::new(),
+            power: [PowerControl::new(); 2],
+            power_reporting: 0,
             procedure_deadline: None,
             report_at: end.wrapping_add(REPORT_INTERVAL_US),
             reported: (Stats::default(), 0),
@@ -848,6 +1001,13 @@ impl Connection {
             tx: [0; DATA_BUFFER_LEN],
             tx_kind: TxKind::Empty,
             tx_sealed: [0; DATA_BUFFER_LEN],
+            version: None,
+            version_request: Request::NotStarted,
+            host_queries: 0,
+            feature_error: None,
+            host_phy: None,
+            phy_status: None,
+            preferred_phys: [PREFERRED_PHYS; 2],
         }
     }
 
@@ -873,9 +1033,22 @@ impl Connection {
         }
     }
 
+    /// Retains a host notification without blocking radio progress.
+    pub(crate) fn notify(&mut self, event: Packet, shared: &Shared) {
+        if self.notifications.iter().all(Option::is_none) && shared.try_push_event(event) {
+            return;
+        }
+        if let Some(slot) = self.notifications.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(event);
+        } else {
+            self.abort = Some(ERROR_HARDWARE_FAILURE);
+        }
+    }
+
     /// Passes the received PDU on and reports acknowledged ACL data.
     #[inline(never)]
     fn process(&mut self, rx: &[u8; BUFFER_LEN], encrypted: bool, shared: &Shared) {
+        self.flush_notifications(shared);
         if self.received {
             self.received = false;
             self.stats.received = self.stats.received.wrapping_add(1);
@@ -920,10 +1093,9 @@ impl Connection {
         }
     }
 
-    /// Validates a received packet before acknowledging anything or touching
-    /// queues. A duplicate uses the preceding CCM counter, so the on-the-fly
-    /// MIC check with the next counter cannot authenticate its acknowledgement.
-    /// Repeat our current answer and wait for a new authenticated PDU instead.
+    /// Validates new data before delivery. Duplicate payloads use the previous
+    /// CCM counter and must not be delivered or consume another nonce. Their
+    /// NESN still acknowledges TX, as in the Core receive sequence and Zephyr.
     fn receive(&mut self, header: u8, len: u8, mic_ok: bool, address: u32, shared: &Shared) -> Option<bool> {
         let llid = header & LLID_MASK;
         let maximum = CONTROL_PAYLOAD_MAX.saturating_add(if self.encryption.rx_on { MIC_LEN } else { 0 });
@@ -931,10 +1103,10 @@ impl Connection {
             self.abort = Some(ERROR_INVALID_PARAMETERS);
             return None;
         }
-        if (header & SN != 0) != self.nesn {
-            // A retransmission proves the central is there, but its
-            // acknowledgement is not authenticated: take nothing else.
+        let duplicate = (header & SN != 0) != self.nesn;
+        if duplicate && self.encryption.rx_on {
             self.last_valid = address;
+            self.acknowledge(header, shared)?;
             return Some(false);
         }
         if self.encryption.rx_on && len != 0 && (usize::from(len) <= MIC_LEN || !mic_ok) {
@@ -954,34 +1126,13 @@ impl Connection {
         }
         self.last_valid = address;
         self.establishment_deadline = None;
-        if (header & NESN != 0) == self.sn {
-            // The central did not hear our last packet. Its first packet of
-            // the connection acknowledges nothing yet.
-            if self.stats.received != 0 {
-                self.power.on_loss();
-            }
-        } else {
-            self.sn = !self.sn;
-            match self.tx_kind {
-                TxKind::Acl => self.completed = self.completed.saturating_add(1),
-                TxKind::Terminate => {
-                    if let Some((reason, false)) = self.terminate {
-                        self.terminate = Some((reason, true));
-                    }
-                },
-                TxKind::Control | TxKind::Empty => {},
-            }
-            self.load_next(shared);
-            if self.abort.is_some() {
-                return None;
-            }
-        }
+        self.acknowledge(header, shared)?;
         let data = header & LLID_MASK != Llid::Control.bits() && len != 0;
-        if !data || shared.has_room() {
+        if !duplicate && (!data || shared.has_room()) {
             self.nesn = !self.nesn;
             self.received = true;
         }
-        Some(true)
+        Some(!duplicate)
     }
 
     /// Logs the counters since the last call.
@@ -995,7 +1146,7 @@ impl Connection {
             self.stats.crc_errors.wrapping_sub(last.crc_errors),
             self.stats.received.wrapping_sub(last.received),
             late.wrapping_sub(last_late),
-            tx_power(self.power.level()),
+            tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()),
             self.drift.0,
             self.drift.1
         );
@@ -1022,7 +1173,7 @@ impl Connection {
                 true
             };
             if let Some(rssi) = radio.rssi() {
-                self.power.on_packet(rssi);
+                for_phy_mut(&mut self.power, self.tx_phy).on_packet(rssi);
             }
             self.receive(header, len, mic_ok, address, shared)?;
         } else {
@@ -1041,7 +1192,7 @@ impl Connection {
                 &self.encryption.tx_config,
                 (self.tx.as_ptr(), self.tx_sealed.as_mut_ptr()),
                 &mut self.encryption.scratch,
-                self.phy,
+                self.tx_phy,
             );
             radio.set_buffer(self.tx_sealed.as_mut_ptr());
         } else {
@@ -1061,9 +1212,29 @@ impl Connection {
         rx: &mut [u8; BUFFER_LEN],
         shared: &Shared,
     ) -> (Ended, Stats) {
+        let entropy = Prefetch::new();
+        match select(self.run_events(radio, clock, rx, shared, &entropy), entropy.run()).await {
+            Either::First(result) => result,
+            Either::Second(never) => never,
+        }
+    }
+
+    /// Schedules radio events independently of entropy collection progress.
+    async fn run_events(
+        &mut self,
+        radio: &mut Radio<'_>,
+        clock: &mut Clock<'_>,
+        rx: &mut [u8; BUFFER_LEN],
+        shared: &Shared,
+        entropy: &Prefetch,
+    ) -> (Ended, Stats) {
         radio.set_s1_included(true);
         self.load_next(shared);
         let ended = loop {
+            if shared.take_reset() {
+                break Ended::Reset;
+            }
+            self.flush_notifications(shared);
             crate::health::checkpoint(10);
             // Flash runs between two events, with the radio parked.
             if crate::maintenance::pending() {
@@ -1080,8 +1251,7 @@ impl Connection {
                 self.terminate = Some((reason, false));
                 self.terminate_deadline = Some(clock.now().wrapping_add(self.timeout));
             }
-            self.drive_encryption(shared);
-            self.start_procedures(clock.now(), shared);
+            self.drive_host(clock.now(), shared, entropy);
             if let Some(reason) = self.abort {
                 break Ended::Error(reason);
             }
@@ -1109,7 +1279,7 @@ impl Connection {
             self.skipped = 0;
             radio.set_channel(channel);
             radio.set_phy(self.phy);
-            radio.set_tx_power(tx_power(self.power.level()));
+            radio.set_tx_power(tx_power(for_phy_mut(&mut self.power, self.tx_phy).level()));
             self.stats.events = self.stats.events.wrapping_add(1);
             let encrypted = self.encryption.rx_on;
             if let Some(address) = self.exchange(radio, clock, rx, window, shared) {
@@ -1162,6 +1332,68 @@ impl Connection {
         (ended, self.stats)
     }
 
+    /// Drives host information requests independently of link encryption.
+    fn service_queries(&mut self, now: u32, shared: &Shared) {
+        if self.notifications.iter().any(Option::is_some) {
+            return;
+        }
+        self.host_queries |= shared.take_queries();
+        if !matches!(self.phy_request, Request::Requested(_))
+            && self.phy_update.is_none()
+            && let Some(preferences) = shared.take_phy_request()
+        {
+            self.host_phy = Some(preferences);
+            self.preferred_phys = preferences;
+            self.phy_request = Request::NotStarted;
+        }
+        if let Some(status) = self.phy_status.take() {
+            self.notify(Packet::phy_update_result(status, self.phy.hci(), self.tx_phy.hci()), shared);
+            self.host_phy = None;
+            shared.complete_query(4);
+        }
+        if let Some(error) = self.feature_error.take() {
+            self.notify(Packet::remote_features_result(error, [0; 8]), shared);
+            self.host_queries &= !1;
+            shared.complete_query(1);
+        }
+        if self.host_queries & 1 != 0 {
+            if let Some(features) = self.central_features {
+                self.notify(Packet::remote_features(features), shared);
+                self.host_queries &= !1;
+                shared.complete_query(1);
+            } else if self.features_request == Request::Done {
+                self.features_request = Request::NotStarted;
+            } else {
+                // The outstanding feature procedure will answer this query.
+            }
+        }
+        if self.host_queries & 2 != 0 {
+            if let Some(version) = self.version {
+                self.notify(Packet::remote_version(version), shared);
+                self.host_queries &= !2;
+                shared.complete_query(2);
+            } else if self.version_request == Request::NotStarted
+                && self.encryption.phase == Phase::Idle
+                && self.queue.iter().all(Option::is_none)
+            {
+                let mut version = [OP_VERSION_IND, 0, 0, 0, 0, 0];
+                if let Some(bytes) = version.get_mut(1..) {
+                    bytes.copy_from_slice(&VERSION);
+                }
+                self.enqueue(Llid::Control, &version);
+                self.version_request = Request::Requested(now.wrapping_add(PROCEDURE_TIMEOUT_US));
+            } else {
+                // Wait for encryption or the outstanding version response.
+            }
+        }
+        if matches!(self.version_request, Request::Requested(deadline) if reached(now, deadline)) {
+            self.abort = Some(ERROR_RESPONSE_TIMEOUT);
+        }
+    }
+
+    /// Applies the default PHY preference when establishing a new link.
+    pub(crate) const fn set_preferred_phys(&mut self, preferences: [u8; 2]) { self.preferred_phys = preferences; }
+
     /// Answers an encryption request: sends the peripheral's session key
     /// diversifier and IV and asks the host for the long term key.
     fn start_encryption(&mut self, params: &[u8]) {
@@ -1171,21 +1403,15 @@ impl Connection {
             self.enqueue(Llid::Control, &[OP_REJECT_IND, ERROR_UNSUPPORTED_FEATURE]);
             return;
         };
-        let mut response = [0_u8; 13];
-        let (opcode, own) = response.split_at_mut(1);
-        if let Some(code) = opcode.first_mut() {
-            *code = OP_ENC_RSP;
+        crypto::wipe(&mut self.encryption.skd);
+        crypto::wipe(&mut self.encryption.iv);
+        if let Some(target) = self.encryption.skd.get_mut(..8) {
+            target.copy_from_slice(&central_skd);
         }
-        random(own);
-        let (own_skd, own_iv) = own.split_at(8);
-        for (target, source) in self.encryption.skd.iter_mut().zip(central_skd.iter().chain(own_skd)) {
-            *target = *source;
+        if let Some(target) = self.encryption.iv.get_mut(..4) {
+            target.copy_from_slice(&central_iv);
         }
-        for (target, source) in self.encryption.iv.iter_mut().zip(central_iv.iter().chain(own_iv)) {
-            *target = *source;
-        }
-        self.enqueue(Llid::Control, &response);
-        self.encryption.phase = Phase::AwaitingKey { requested: false, rand, ediv };
+        self.encryption.phase = Phase::AwaitingEntropy { rand, ediv };
     }
 
     /// Window widening after `elapsed` microseconds since the last anchor.
@@ -1244,6 +1470,15 @@ fn parse_update(bytes: &[u8]) -> Option<Update> {
         win_offset: u32::from(u16::from_le_bytes([offset0, offset1])).saturating_mul(UNIT_1250_US),
         win_size: u32::from(win_size).saturating_mul(UNIT_1250_US),
     })
+}
+
+/// Selects per-PHY state without indexing or a fallible conversion.
+const fn for_phy_mut<Value>(values: &mut [Value; 2], phy: Phy) -> &mut Value {
+    let &mut [ref mut one, ref mut two] = values;
+    match phy {
+        Phy::M1 => one,
+        Phy::M2 => two,
+    }
 }
 
 /// Transmit power in dBm of power control level `level`.

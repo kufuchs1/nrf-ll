@@ -122,23 +122,54 @@ impl Default for FilterList {
     fn default() -> Self { Self::new() }
 }
 
+/// Privacy state belonging to one peer identity.
+#[derive(Clone, Copy)]
+struct ResolvingEntry {
+    /// Device privacy accepts identity addresses as well as RPAs.
+    device: bool,
+    /// Peer identity resolving key.
+    irk:    [u8; 16],
+    /// Local identity resolving key for this peer.
+    local:  [u8; 16],
+    /// Identity address.
+    peer:   Peer,
+}
+
 /// Peers whose resolvable private addresses are resolved to their identity
 /// address, with their identity resolving keys.
 #[derive(Clone, Copy)]
 pub struct ResolvingList {
     /// Identity address and key of each peer.
-    entries: [Option<(Peer, [u8; 16])>; RESOLVING_LIST_SIZE],
+    entries: [Option<ResolvingEntry>; RESOLVING_LIST_SIZE],
 }
 
 impl ResolvingList {
+    /// Whether an identity address is acceptable under its privacy mode.
+    fn accepts_identity(&self, peer: Peer) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.peer == peer)
+            .is_none_or(|entry| entry.device || entry.irk == [0; 16])
+    }
+
     /// Adds or replaces the key of `identity`. Returns false if the list is
     /// full.
     #[inline]
-    pub fn add(&mut self, identity: Peer, irk: [u8; 16]) -> bool {
+    pub fn add(&mut self, identity: Peer, irk: [u8; 16]) -> bool { self.add_keys(identity, irk, [0; 16]) }
+
+    /// Stores both keys, preserving the per-peer privacy mode.
+    #[inline]
+    pub fn add_keys(&mut self, identity: Peer, irk: [u8; 16], local: [u8; 16]) -> bool {
         self.remove(identity);
         let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) else { return false };
-        *slot = Some((identity, irk));
+        *slot = Some(ResolvingEntry { peer: identity, irk, local, device: false });
         true
+    }
+
+    /// Whether a new entry or a replacement fits without changing the list.
+    pub(crate) fn can_add(&self, peer: Peer) -> bool {
+        self.entries.iter().any(|entry| entry.is_none_or(|listed| listed.peer == peer))
     }
 
     /// Removes every peer, overwriting their keys.
@@ -150,9 +181,10 @@ impl ResolvingList {
     }
 
     /// Overwrites the key in `slot` and empties it.
-    fn forget(slot: &mut Option<(Peer, [u8; 16])>) {
-        if let Some(&mut (_, ref mut irk)) = slot.as_mut() {
-            crypto::wipe(irk);
+    fn forget(slot: &mut Option<ResolvingEntry>) {
+        if let Some(entry) = slot.as_mut() {
+            crypto::wipe(&mut entry.irk);
+            crypto::wipe(&mut entry.local);
         }
         *slot = None;
     }
@@ -166,13 +198,24 @@ impl ResolvingList {
         self.entries
             .iter()
             .flatten()
-            .find(|&&(_, irk)| crypto::resolves(irk, address.address))
-            .map(|&(identity, _)| identity)
+            .find(|entry| entry.irk != [0; 16] && crypto::resolves(entry.irk, address.address))
+            .map(|entry| entry.peer)
     }
 
     /// Whether no peer is listed.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool { self.entries.iter().all(Option::is_none) }
+
+    /// Local key associated with the directed peer or first listed peer.
+    #[inline]
+    #[must_use = "the key is only read"]
+    pub fn local_key(&self, peer: Option<Peer>) -> Option<[u8; 16]> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| peer.is_none_or(|target| target == entry.peer) && entry.local != [0; 16])
+            .map(|entry| entry.local)
+    }
 
     /// An empty list.
     #[inline]
@@ -183,10 +226,18 @@ impl ResolvingList {
     #[inline]
     pub fn remove(&mut self, identity: Peer) {
         for slot in &mut self.entries {
-            if slot.is_some_and(|(listed, _)| listed == identity) {
+            if slot.is_some_and(|entry| entry.peer == identity) {
                 Self::forget(slot);
             }
         }
+    }
+
+    /// Changes the privacy mode of an existing identity.
+    #[inline]
+    pub fn set_mode(&mut self, peer: Peer, device: bool) -> bool {
+        let Some(entry) = self.entries.iter_mut().flatten().find(|entry| entry.peer == peer) else { return false };
+        entry.device = device;
+        true
     }
 }
 
@@ -200,49 +251,54 @@ impl Default for ResolvingList {
 #[non_exhaustive]
 pub struct Settings {
     /// Own address as the host set it, the identity address with privacy.
-    pub address:       Peer,
+    pub address:            Peer,
     /// Advertising channels, bit 0 for channel 37.
-    pub channel_map:   u8,
+    pub channel_map:        u8,
     /// Advertising data.
-    pub data:          [u8; DATA_MAX],
+    pub data:               [u8; DATA_MAX],
     /// Filter accept list.
-    pub filter:        FilterList,
+    pub filter:             FilterList,
     /// Filter policy: bit 0 filters scan requests, bit 1 connection requests.
-    pub filter_policy: u8,
+    pub filter_policy:      u8,
     /// Advertising interval in microseconds.
-    pub interval:      u32,
+    pub interval:           u32,
     /// Advertising type.
-    pub kind:          Kind,
+    pub kind:               Kind,
     /// Length of [`Self::data`].
-    pub len:           u8,
+    pub len:                u8,
     /// Address on air: [`Self::address`], or a resolvable private address
     /// generated when the advertising starts.
-    pub own:           Peer,
+    pub own:                Peer,
     /// Target of directed advertising.
-    pub peer:          Peer,
+    pub peer:               Peer,
     /// The host asked for a resolvable private address.
-    pub private:       bool,
+    pub private:            bool,
+    /// Whether address resolution is enabled by the host.
+    pub resolution_enabled: bool,
     /// Peers whose private addresses the filter accept list resolves.
-    pub resolving:     ResolvingList,
+    pub resolving:          ResolvingList,
     /// Scan response data.
-    pub scan_data:     [u8; DATA_MAX],
+    pub scan_data:          [u8; DATA_MAX],
     /// Length of [`Self::scan_data`].
-    pub scan_len:      u8,
+    pub scan_len:           u8,
 }
 
 impl Settings {
     /// Whether a central may connect. With the filter accept list, a
     /// resolvable private address counts as the identity it resolves to.
     fn accepts_connection(&self, central: Peer) -> bool {
+        if self.resolution_enabled && !self.resolving.accepts_identity(central) {
+            return false;
+        }
         if self.kind.is_directed() {
             // A central with privacy answers from a resolvable private
             // address of the identity the advertising is directed to.
-            return central == self.peer || self.resolving.identity(central) == Some(self.peer);
+            return central == self.peer || self.resolve(central) == Some(self.peer);
         }
         self.kind.is_connectable()
             && (self.filter_policy & 0x02 == 0
                 || self.filter.contains(central)
-                || self.resolving.identity(central).is_some_and(|identity| self.filter.contains(identity)))
+                || self.resolve(central).is_some_and(|identity| self.filter.contains(identity)))
     }
 
     /// Whether a scanner gets a scan response. With the filter accept list,
@@ -251,10 +307,13 @@ impl Settings {
     /// of about 7 us per listed peer, and only for an address of the
     /// resolvable type that is not listed itself.
     fn accepts_scan(&self, scanner: Peer) -> bool {
+        if self.resolution_enabled && !self.resolving.accepts_identity(scanner) {
+            return false;
+        }
         matches!(self.kind, Kind::ConnectableUndirected | Kind::Scannable)
             && (self.filter_policy & 0x01 == 0
                 || self.filter.contains(scanner)
-                || self.resolving.identity(scanner).is_some_and(|identity| self.filter.contains(identity)))
+                || self.resolve(scanner).is_some_and(|identity| self.filter.contains(identity)))
     }
 
     /// The defaults after a reset.
@@ -262,20 +321,21 @@ impl Settings {
     #[must_use = "the settings are only created"]
     pub const fn new() -> Self {
         Self {
-            address:       Peer::new([0; 6], true),
-            channel_map:   0x07,
-            data:          [0; DATA_MAX],
-            filter:        FilterList::new(),
-            filter_policy: 0,
-            interval:      1_280_000,
-            kind:          Kind::ConnectableUndirected,
-            len:           0,
-            own:           Peer::new([0; 6], true),
-            peer:          Peer::new([0; 6], false),
-            private:       false,
-            resolving:     ResolvingList::new(),
-            scan_data:     [0; DATA_MAX],
-            scan_len:      0,
+            address:            Peer::new([0; 6], true),
+            channel_map:        0x07,
+            data:               [0; DATA_MAX],
+            filter:             FilterList::new(),
+            filter_policy:      0,
+            interval:           1_280_000,
+            kind:               Kind::ConnectableUndirected,
+            len:                0,
+            own:                Peer::new([0; 6], true),
+            peer:               Peer::new([0; 6], false),
+            private:            false,
+            resolving:          ResolvingList::new(),
+            resolution_enabled: false,
+            scan_data:          [0; DATA_MAX],
+            scan_len:           0,
         }
     }
 
@@ -292,6 +352,13 @@ impl Settings {
             Kind::Scannable => LegacyAdvertisement::undirected(ADV_SCAN_IND, self.own, data),
         };
         (primary, LegacyAdvertisement::undirected(SCAN_RSP, self.own, scan_data))
+    }
+
+    /// Resolves a received private address only when resolution is enabled.
+    #[must_use = "the identity is only read"]
+    #[inline]
+    pub fn resolve(&self, peer: Peer) -> Option<Peer> {
+        self.resolution_enabled.then(|| self.resolving.identity(peer)).flatten()
     }
 }
 

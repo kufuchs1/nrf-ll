@@ -25,6 +25,46 @@ fn connection() -> Connection {
 }
 
 #[test]
+fn version_indication_is_queued_only_once_per_connection() {
+    let mut link = connection();
+    let version = [OP_VERSION_IND, 0x0B, 0, 0, 0, 0];
+    link.handle_control(&version, false);
+    assert_eq!(link.queue.iter().flatten().count(), 1);
+    assert_eq!(link.queue[0].unwrap().data[0], OP_VERSION_IND);
+    link.queue = [None; QUEUE_LEN];
+    for _ in 0..10 {
+        link.handle_control(&version, false);
+    }
+    assert!(link.queue.iter().all(Option::is_none));
+    assert_eq!(link.abort, None);
+}
+
+#[test]
+fn unanswered_control_procedures_end_the_link_despite_keepalives() {
+    let shared = Shared::new();
+    for procedure in 0..3 {
+        let mut link = connection();
+        link.establishment_deadline = None;
+        match procedure {
+            0 => link.features_request = Request::Requested(1000),
+            1 => link.phy_request = Request::Requested(1000),
+            _ => link.param_request = Some(1000),
+        }
+        link.last_valid = 999;
+        link.start_procedures(999, &shared);
+        assert_eq!(link.abort, None);
+        link.start_procedures(1000, &shared);
+        assert!(matches!(link.ended(1000), Some(Ended::Error(ERROR_RESPONSE_TIMEOUT))));
+    }
+    let mut link = connection();
+    link.features_request = Request::Requested(5);
+    link.start_procedures(u32::MAX, &shared);
+    assert_eq!(link.abort, None);
+    link.start_procedures(5, &shared);
+    assert_eq!(link.abort, Some(ERROR_RESPONSE_TIMEOUT));
+}
+
+#[test]
 fn keepalive_packets_cannot_extend_a_local_disconnect_deadline() {
     let mut link = connection();
     link.establishment_deadline = None;
@@ -141,7 +181,7 @@ fn bad_mic_cannot_acknowledge_acl_or_move_sequence_numbers() {
 }
 
 #[test]
-fn every_unverified_nonempty_header_and_length_preserves_sequence_state() {
+fn unverified_new_payloads_never_change_receive_sequence_state() {
     let shared = Shared::new();
     for header in 0..=u8::MAX {
         for len in 1..=u8::MAX {
@@ -150,8 +190,10 @@ fn every_unverified_nonempty_header_and_length_preserves_sequence_state() {
             link.tx_kind = TxKind::Acl;
             let result = link.receive(header, len, false, 999, &shared);
             assert_ne!(result, Some(true), "header={header:#x}, len={len}");
-            assert!(!link.sn && !link.nesn && !link.received);
-            assert_eq!(link.completed, 0);
+            assert!(!link.nesn && !link.received);
+            let acknowledged = result == Some(false) && header & NESN != 0;
+            assert_eq!(link.sn, acknowledged);
+            assert_eq!(link.completed, u16::from(acknowledged));
             // Only a retransmission keeps the link alive.
             assert_eq!(link.last_valid, if result == Some(false) { 999 } else { 100 });
             assert_eq!(link.encryption.rx_counter, 0);
@@ -160,15 +202,15 @@ fn every_unverified_nonempty_header_and_length_preserves_sequence_state() {
 }
 
 #[test]
-fn retransmission_does_not_consume_nonce_or_unverified_ack() {
+fn encrypted_retransmission_acknowledges_tx_without_consuming_rx_nonce() {
     let mut link = connection();
     link.encryption.rx_on = true;
     link.nesn = true;
     link.tx_kind = TxKind::Acl;
     assert_eq!(link.receive(Llid::Start.bits() | NESN, 5, false, 999, &Shared::new()), Some(false));
     assert_eq!(link.abort, None);
-    assert!(!link.sn && link.nesn && !link.received);
-    assert_eq!(link.completed, 0);
+    assert!(link.sn && link.nesn && !link.received);
+    assert_eq!(link.completed, 1);
     // It shows the central is there, which keeps the link alive.
     assert_eq!(link.last_valid, 999);
     assert!(link.payload_timer.is_none());
@@ -356,8 +398,7 @@ fn a_key_refresh_pauses_encryption_both_ways() {
     assert_eq!(link.abort, None);
     assert!(!link.encryption.tx_on);
     assert!(link.encryption.phase == Phase::Paused);
-    // The new encryption request draws random numbers from the hardware,
-    // which the host tests do not have.
+    // A refresh now waits for a separate, single-use prefetched block.
 }
 
 #[test]
@@ -401,7 +442,7 @@ fn phy_updates_without_a_change_asymmetric_or_coded_are_handled() {
     link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 10, 0], true);
     assert_eq!(link.abort, None);
     assert!(link.phy_update.is_none());
-    for (to_peripheral, to_central) in [(2, 1), (1, 2), (4, 4), (3, 3)] {
+    for (to_peripheral, to_central) in [(4, 4), (3, 3)] {
         let mut link = encrypted();
         link.handle_control(&[OP_PHY_UPDATE_IND, to_peripheral, to_central, 10, 0], true);
         assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
@@ -427,7 +468,7 @@ fn the_peripheral_asks_for_2m_once_encrypted_and_answers_a_central_request() {
     let mut link = encrypted();
     link.handle_control(&[OP_PHY_REQ, 3, 3], true);
     assert_eq!(link.queue[0].map(|queued| queued.data[..3] == [OP_PHY_RSP, 2, 2]), Some(true));
-    assert!(link.phy_request == Request::Done);
+    assert!(matches!(link.phy_request, Request::Requested(_)));
 }
 
 /// A connection parameter request PDU: interval 12 to 24, latency 4,
@@ -528,10 +569,11 @@ fn power_changes_are_announced_only_to_a_central_that_supports_them() {
     link.phy_request = Request::Done;
     link.features_request = Request::Done;
     link.central_features = Some([0x1F, 0, 0, 0, 0, 0, 0, 0]);
-    link.power.on_loss();
+    link.power[0].on_loss();
     link.start_procedures(0, &shared);
     assert!(link.queue[0].is_none());
     link.central_features = Some([0x1F, 0, 0, 0, 0x06, 0, 0, 0]);
+    link.power_reporting = 1;
     link.start_procedures(0, &shared);
     let indication = link.queue[0].unwrap();
     assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 1, 0, 3, 3]);
@@ -560,6 +602,7 @@ fn the_peripheral_pings_before_the_authenticated_payload_timeout() {
 #[test]
 fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
     let phases = [
+        Phase::AwaitingEntropy { rand: [0; 8], ediv: [0; 2] },
         Phase::AwaitingKey { requested: true, rand: [0; 8], ediv: [0; 2] },
         Phase::Starting,
         Phase::AwaitingStartResponse,
@@ -590,6 +633,7 @@ fn data_while_encryption_starts_or_pauses_ends_the_link_unacknowledged() {
 fn a_parameter_request_during_another_instant_is_a_transaction_collision() {
     let mut link = encrypted();
     link.phy_update = Some((Phy::M2, 10));
+    link.next_tx_phy = Phy::M2;
     link.handle_control(&parameter_request(OP_CONNECTION_PARAM_REQ), true);
     assert_eq!(
         link.queue[0].map(|queued| queued.data[..3] == [OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, 0x2A]),
@@ -668,4 +712,211 @@ fn a_finished_link_leaves_no_key_material_behind() {
     assert_eq!(link.encryption.skd, [0; 16]);
     assert_eq!(link.encryption.iv, [0; 8]);
     assert!(link.encryption.scratch.iter().all(|&byte| byte == 0));
+}
+
+#[test]
+fn plain_duplicate_can_acknowledge_tx_without_delivering_rx_twice() {
+    let mut link = connection();
+    link.nesn = true;
+    link.tx_kind = TxKind::Acl;
+    assert_eq!(link.receive(Llid::Start.bits() | NESN, 1, true, 999, &Shared::new()), Some(false));
+    assert!(link.sn && link.nesn && !link.received);
+    assert_eq!(link.completed, 1);
+}
+
+#[test]
+fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
+    for (receive, transmit) in [(1, 2), (2, 1)] {
+        let mut link = connection();
+        link.handle_control(&[OP_PHY_UPDATE_IND, receive, transmit, 10, 0], false);
+        assert_eq!(link.abort, None);
+        link.counter = 10;
+        link.apply_instants(&Shared::new());
+        assert_eq!(link.phy.hci(), receive);
+        assert_eq!(link.tx_phy.hci(), transmit);
+        link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 20, 0], false);
+        assert_eq!(link.phy.hci(), receive);
+        assert_eq!(link.tx_phy.hci(), transmit);
+    }
+}
+
+#[test]
+fn host_notifications_survive_queue_pressure() {
+    let full = Shared::with_all_events();
+    for _ in 0..4 {
+        assert!(full.try_push_event(Packet::completed_packets(1)));
+    }
+    let mut link = connection();
+    link.notify(
+        Packet::connection_complete(0, (crate::pdu::Peer::new([1; 6], false), None), link.current_params(), 0),
+        &full,
+    );
+    link.handle_control(&[OP_PHY_UPDATE_IND, 2, 2, 10, 0], false);
+    assert_eq!(link.abort, None);
+    link.counter = 10;
+    link.apply_instants(&full);
+    assert_eq!(link.notifications.iter().flatten().count(), 2);
+    let available = Shared::with_all_events();
+    link.flush_notifications(&available);
+    assert!(link.notifications.iter().all(Option::is_none));
+    for _ in 0..2 {
+        assert!(available.try_push_event(Packet::completed_packets(1)));
+    }
+    assert!(!available.try_push_event(Packet::completed_packets(1)));
+}
+
+#[test]
+fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
+    for phy in [0, 3, 4, 8, 255] {
+        let mut link = connection();
+        link.handle_control(&[OP_POWER_CONTROL_REQ, phy, 0, 0], false);
+        assert_eq!(link.queue[0].unwrap().data[..3], [
+            OP_REJECT_EXT_IND,
+            OP_POWER_CONTROL_REQ,
+            ERROR_UNSUPPORTED_VALUE
+        ]);
+    }
+    let mut link = connection();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 0, 126], false);
+    assert_eq!(link.queue[0].unwrap().data[2], ERROR_INVALID_PARAMETERS);
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 2, (-6_i8).cast_unsigned(), 0], false);
+    assert_eq!(tx_power(link.power[0].level()), 0);
+    assert_eq!(tx_power(link.power[1].level()), -4);
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 2, 0x7F, 0], false);
+    assert_eq!(tx_power(link.power[1].level()), 4);
+}
+
+#[test]
+fn host_remote_queries_work_without_encryption_and_version_is_sent_once() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    shared.request_queries(3);
+    link.service_queries(0, &shared);
+    assert_eq!(link.queue[0].unwrap().data[0], OP_VERSION_IND);
+    link.queue = [None; QUEUE_LEN];
+    link.start_procedures(0, &shared);
+    assert_eq!(link.queue[0].unwrap().data[0], OP_PERIPHERAL_FEATURE_REQ);
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&[OP_VERSION_IND, 11, 1, 2, 3, 4], false);
+    assert!(link.queue.iter().all(Option::is_none));
+    link.handle_control(&[OP_FEATURE_RSP, 31, 1, 0, 0, 0, 0, 0, 0], false);
+    link.service_queries(10, &shared);
+    assert_eq!(link.host_queries, 0);
+    for _ in 0..2 {
+        assert!(shared.try_push_event(Packet::completed_packets(1)));
+    }
+    assert!(!shared.try_push_event(Packet::completed_packets(1)));
+}
+
+#[test]
+fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    link.host_phy = Some([1, 2]);
+    link.preferred_phys = [1, 2];
+    link.start_procedures(0, &shared);
+    assert_eq!(link.queue[0].unwrap().data[..3], [OP_PHY_REQ, 1, 2]);
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&[OP_PHY_UPDATE_IND, 0, 0, 0, 0], false);
+    assert_eq!(link.phy_status, Some(0));
+    link.service_queries(1, &shared);
+    assert!(link.host_phy.is_none());
+    assert!(link.phy_status.is_none());
+    for _ in 0..3 {
+        assert!(shared.try_push_event(Packet::completed_packets(1)));
+    }
+    assert!(!shared.try_push_event(Packet::completed_packets(1)));
+}
+
+#[test]
+fn encryption_waits_without_rng_work_and_builds_the_prefetched_response() {
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Waker},
+    };
+    let shared = Shared::with_all_events();
+    shared.set_connected(true);
+    let prefetch = Prefetch::new();
+    let mut link = connection();
+    let mut request = [0x11; 23];
+    request[0] = OP_ENC_REQ;
+    link.handle_control(&request, false);
+    assert!(matches!(link.encryption.phase, Phase::AwaitingEntropy { .. }));
+    for _ in 0..5 {
+        link.drive_encryption(&shared, &prefetch);
+        assert!(link.queue.iter().all(Option::is_none));
+        assert_eq!(link.abort, None);
+    }
+    // Radio keepalives remain valid while the separate producer is pending.
+    assert_eq!(link.receive(Llid::Continuation.bits(), 0, true, 200, &shared), Some(true));
+    let mut worker = pin!(prefetch.run_with(async |bytes: &mut [u8]| bytes.fill(0x22)));
+    assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    link.drive_encryption(&shared, &prefetch);
+    assert!(
+        matches!(link.encryption.phase, Phase::AwaitingKey { rand, ediv, .. } if rand == [0x11; 8] && ediv == [0x11; 2])
+    );
+    let response = link.queue[0].unwrap();
+    assert_eq!(response.data[0], OP_ENC_RSP);
+    assert_eq!(&response.data[1..13], &[0x22; 12]);
+    assert_eq!(&link.encryption.skd[..8], &[0x11; 8]);
+    assert_eq!(&link.encryption.skd[8..], &[0x22; 8]);
+    assert_eq!(&link.encryption.iv[..4], &[0x11; 4]);
+    assert_eq!(&link.encryption.iv[4..], &[0x22; 4]);
+    assert!(prefetch.take().is_none());
+}
+
+#[test]
+fn encryption_refresh_consumes_a_different_prefetched_block() {
+    use core::{
+        cell::Cell,
+        future::Future,
+        pin::pin,
+        task::{Context, Waker},
+    };
+    let shared = Shared::new();
+    let prefetch = Prefetch::new();
+    let produced = Cell::new(0_u8);
+    let mut worker = pin!(prefetch.run_with(async |bytes: &mut [u8]| {
+        produced.set(produced.get() + 1);
+        bytes.fill(produced.get());
+    }));
+    let mut context = Context::from_waker(Waker::noop());
+    let mut link = connection();
+    let mut request = [0x11; 23];
+    request[0] = OP_ENC_REQ;
+    assert!(worker.as_mut().poll(&mut context).is_pending());
+    link.handle_control(&request, false);
+    link.drive_encryption(&shared, &prefetch);
+    assert_eq!(&link.queue[0].unwrap().data[1..13], &[1; 12]);
+    assert!(worker.as_mut().poll(&mut context).is_pending());
+    // Model the encrypted link after its pause handshake completed.
+    link.encryption.phase = Phase::Paused;
+    link.encryption.rx_on = false;
+    link.encryption.tx_on = false;
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&request, false);
+    assert!(link.encryption.procedure == Procedure::Refresh);
+    link.drive_encryption(&shared, &prefetch);
+    assert_eq!(&link.queue[0].unwrap().data[1..13], &[2; 12]);
+    assert_eq!(&link.encryption.iv[4..], &[2; 4]);
+    assert!(prefetch.take().is_none());
+}
+
+#[test]
+fn entropy_wait_preserves_response_deadline_and_accepts_termination() {
+    let mut request = [0x11; 23];
+    request[0] = OP_ENC_REQ;
+    let mut link = connection();
+    link.handle_control(&request, false);
+    let deadline = link.procedure_deadline.unwrap();
+    link.last_valid = deadline - 1;
+    assert!(matches!(link.ended(deadline), Some(Ended::Error(ERROR_RESPONSE_TIMEOUT))));
+    let mut link = connection();
+    link.handle_control(&request, false);
+    link.handle_control(&[OP_TERMINATE_IND, 0x13], false);
+    assert!(matches!(link.ended(101), Some(Ended::Terminated(0x13))));
+    assert!(link.queue.iter().all(Option::is_none));
 }
