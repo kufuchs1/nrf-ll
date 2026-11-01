@@ -30,7 +30,8 @@ replacement firmwares for the Logitech MX Keys S keyboard and the MX Master 3S m
   the new key without a disconnection. An encrypted link has to carry a packet with a valid MIC at least every 30 s,
   or as long as the host sets: after three quarters of that time without one, the link layer pings the central, and
   the host learns when the whole time passes. A central that leaves the ping unanswered for 40 s ends the link with
-  an LL response timeout, as any other procedure does.
+  an LL response timeout, as any other procedure does. A key reply to an LTK request whose link ended before the host
+  answered is taken without effect, so a central that leaves while encryption starts cannot stop the host.
 - **Connection updates from the host** run one at a time: LE Connection Update returns Command Disallowed until the
   previous one reported its LE Connection Update Complete event.
 - **Data length extension** (feature `data-length`): payloads of up to 251 octets each way instead of 27. The link layer

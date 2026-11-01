@@ -558,6 +558,17 @@ impl ConnectionParams {
     pub const fn new(interval: u16, latency: u16, timeout: u16) -> Self { Self { interval, latency, timeout } }
 }
 
+/// LTK requests the host has to answer.
+#[derive(Clone, Copy)]
+struct KeyRequests {
+    /// A request of a link that ended before the host answered it: the
+    /// host's reply is moot and must not fail, which would stop a host such
+    /// as `TrouBLE`. Cleared once the host read the disconnection.
+    orphaned: bool,
+    /// A key reply is accepted only after an LTK request was queued.
+    pending:  bool,
+}
+
 /// Host state kept by the controller.
 struct HostState {
     /// Host query opcodes already accepted but not completed.
@@ -576,8 +587,8 @@ struct HostState {
     legacy:            LegacySettings,
     /// Whether the host enabled legacy advertising.
     legacy_enabled:    bool,
-    /// A key reply is accepted only after an LTK request was queued.
-    ltk_pending:       bool,
+    /// LTK requests the host has to answer.
+    ltk:               KeyRequests,
     /// LE Connection Update commands the host sent while it answered a
     /// central's request, each owed a complete event when that ends.
     merged_updates:    u8,
@@ -662,7 +673,7 @@ impl HostState {
             le_event_mask: LE_EVENT_MASK_DEFAULT,
             legacy: LegacySettings::new(),
             legacy_enabled: false,
-            ltk_pending: false,
+            ltk: KeyRequests { orphaned: false, pending: false },
             merged_updates: 0,
             payload_timeout: DEFAULT_PAYLOAD_TIMEOUT,
             private_address: None,
@@ -772,6 +783,16 @@ impl Shared {
     /// Ends a central's connection parameter request the host was asked
     /// about, answered or not.
     pub(crate) fn end_parameter_request(&self) { self.complete_query(QUERY_REMOTE_PARAMETERS); }
+
+    /// Notes an event the host reads. Once it reads a disconnection it has
+    /// answered every LTK request of that link it is going to answer: the
+    /// requests come before the disconnection, and a host handles its events
+    /// in order. A later key reply is no longer taken as moot.
+    fn event_read(&self, packet: &Packet) {
+        if packet.bytes.first() == Some(&EVENT_DISCONNECTION_COMPLETE) {
+            self.state.lock(|cell| cell.borrow_mut().ltk.orphaned = false);
+        }
+    }
 
     /// Lets the host start another connection update once the current one
     /// reported its outcome.
@@ -936,7 +957,7 @@ impl Shared {
     pub fn request_ltk(&self, rand: [u8; 8], ediv: [u8; 2]) -> bool {
         self.state.lock(|cell| {
             let mut state = cell.borrow_mut();
-            if !state.connected || state.ltk_pending {
+            if !state.connected || state.ltk.pending {
                 return false;
             }
             if !state.allows(EVENT_LE_META, LE_LTK_REQUEST) {
@@ -946,7 +967,7 @@ impl Shared {
             if self.events.try_send(Packet::ltk_request(rand, ediv)).is_err() {
                 return false;
             }
-            state.ltk_pending = true;
+            state.ltk.pending = true;
             true
         })
     }
@@ -976,7 +997,8 @@ impl Shared {
             let changed = state.connected != connected;
             if changed {
                 state.epoch = state.epoch.wrapping_add(1);
-                state.ltk_pending = false;
+                state.ltk.orphaned |= state.ltk.pending;
+                state.ltk.pending = false;
                 state.remote_features = 0;
                 state.queries = 0;
                 state.active_queries = 0;
@@ -1361,10 +1383,17 @@ impl<'shared> Hci<'shared> {
                 }
                 let status = self.shared.state.lock(|cell| {
                     let mut state = cell.borrow_mut();
+                    // The answer to a request of a link that is gone: taken,
+                    // without a key for anything. Replies come in the order
+                    // of the requests, so it is the first one after it.
+                    if state.ltk.orphaned {
+                        state.ltk.orphaned = false;
+                        return STATUS_SUCCESS;
+                    }
                     if !state.connected || params.get(..2) != Some(CONNECTION_HANDLE.to_le_bytes().as_slice()) {
                         return STATUS_UNKNOWN_CONNECTION;
                     }
-                    if !state.ltk_pending {
+                    if !state.ltk.pending {
                         return STATUS_DISALLOWED;
                     }
                     let key = if opcode == 0x201A {
@@ -1372,7 +1401,7 @@ impl<'shared> Hci<'shared> {
                     } else {
                         None
                     };
-                    state.ltk_pending = false;
+                    state.ltk.pending = false;
                     self.shared.ltk.signal(key);
                     self.shared.wakeup.signal(());
                     STATUS_SUCCESS
@@ -1844,6 +1873,7 @@ impl Transport for Hci<'_> {
     {
         match select(self.shared.events.receive(), self.shared.acl_in.receive()).await {
             Either::First(packet) => {
+                self.shared.event_read(&packet);
                 let mut bytes = packet.bytes.get(..packet.len).unwrap_or_default();
                 P::read_hci(packet.kind, &mut bytes, rx).map_err(TransportError::from)
             },
@@ -2143,6 +2173,45 @@ mod tests {
         assert!(shared.request_ltk([0; 8], [0; 2]));
         assert_eq!(hci.command_sync(0x201B, &[0, 0], &mut returned).0, STATUS_SUCCESS);
         assert_eq!(shared.take_ltk(), Some(None));
+    }
+
+    #[test]
+    fn a_key_reply_for_a_link_that_ended_is_taken_without_effect() {
+        let shared = Shared::with_all_events();
+        shared.set_connected(true);
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        let mut params = [0xAA; 18];
+        params[..2].fill(0);
+        // The central asks for encryption and leaves before the host answers.
+        assert!(shared.request_ltk([0; 8], [0; 2]));
+        shared.set_connected(false);
+        assert_eq!(hci.command_sync(0x201A, &params, &mut returned).0, STATUS_SUCCESS);
+        assert!(shared.take_ltk().is_none());
+        // Only that one reply: another is still refused.
+        assert_eq!(hci.command_sync(0x201B, &[0, 0], &mut returned).0, STATUS_UNKNOWN_CONNECTION);
+        // A new link asked for its own key before the host answered the old
+        // request: the first reply belongs to the old link, the next one is
+        // the new link's key.
+        shared.set_connected(true);
+        assert!(shared.request_ltk([0; 8], [0; 2]));
+        shared.set_connected(false);
+        shared.set_connected(true);
+        assert!(shared.request_ltk([1; 8], [1; 2]));
+        assert_eq!(hci.command_sync(0x201B, &[0, 0], &mut returned).0, STATUS_SUCCESS);
+        assert!(shared.take_ltk().is_none());
+        assert_eq!(hci.command_sync(0x201A, &params, &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.take_ltk(), Some(Some([0xAA; 16])));
+    }
+
+    #[test]
+    fn a_host_that_read_the_disconnection_gets_no_moot_reply() {
+        let shared = Shared::with_all_events();
+        shared.set_connected(true);
+        assert!(shared.request_ltk([0; 8], [0; 2]));
+        shared.set_connected(false);
+        shared.event_read(&Packet::disconnection_complete(0x13));
+        assert_eq!(Hci::new(&shared).command_sync(0x201B, &[0, 0], &mut [0; 8]).0, STATUS_UNKNOWN_CONNECTION);
     }
 
     #[test]
