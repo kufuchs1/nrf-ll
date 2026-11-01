@@ -558,6 +558,16 @@ impl ConnectionParams {
     pub const fn new(interval: u16, latency: u16, timeout: u16) -> Self { Self { interval, latency, timeout } }
 }
 
+/// How an event reaches the host, by its event masks.
+enum Admission {
+    /// As it is.
+    AsIs,
+    /// As the plain LE connection complete event.
+    Legacy,
+    /// Not at all: the host masked it.
+    Masked,
+}
+
 /// LTK requests the host has to answer.
 #[derive(Clone, Copy)]
 struct KeyRequests {
@@ -614,6 +624,22 @@ struct HostState {
 }
 
 impl HostState {
+    /// How an event reaches the host, by its event masks: not at all, as it
+    /// is, or as the plain LE connection complete event for a host without
+    /// the enhanced one. Takes the packet by reference, so the interrupt that
+    /// queues it does not copy it through this call.
+    fn admit(&self, packet: &Packet) -> Admission {
+        if !matches!(packet.kind, PacketKind::Event) {
+            return Admission::AsIs;
+        }
+        let [code, _, subevent, ..] = packet.bytes;
+        if self.allows(code, subevent) {
+            return Admission::AsIs;
+        }
+        let enhanced = code == EVENT_LE_META && subevent == LE_ENHANCED_CONNECTION_COMPLETE;
+        if enhanced && self.allows(code, LE_CONNECTION_COMPLETE) { Admission::Legacy } else { Admission::Masked }
+    }
+
     /// Whether the host's masks let the event with `code`, and `subevent`
     /// for an LE meta event, through.
     fn allows(&self, code: u8, subevent: u8) -> bool {
@@ -631,21 +657,6 @@ impl HostState {
     fn cached_address(&self, key: [u8; 16], now: Instant) -> Option<Peer> {
         let (address, made_with, expires) = self.private_address?;
         (made_with == key && now < expires).then_some(address)
-    }
-
-    /// `packet` as the host's event masks let it through: unchanged, as the
-    /// LE connection complete event if only that one is enabled, or not at
-    /// all (Core, Vol 4, Part E, 7.3.1 and 7.8.1).
-    fn deliver(&self, packet: Packet) -> Option<Packet> {
-        if !matches!(packet.kind, PacketKind::Event) {
-            return Some(packet);
-        }
-        let [code, _, subevent, ..] = packet.bytes;
-        if self.allows(code, subevent) {
-            return Some(packet);
-        }
-        let enhanced = code == EVENT_LE_META && subevent == LE_ENHANCED_CONNECTION_COMPLETE;
-        (enhanced && self.allows(code, LE_CONNECTION_COMPLETE)).then(|| packet.legacy_connection_complete())
     }
 
     /// Overwrites every identity resolving key before it is dropped.
@@ -913,8 +924,10 @@ impl Shared {
     /// masked is dropped.
     #[inline]
     pub async fn push_event(&self, packet: Packet) {
-        if let Some(event) = self.state.lock(|cell| cell.borrow().deliver(packet)) {
-            self.events.send(event).await;
+        match self.state.lock(|cell| cell.borrow().admit(&packet)) {
+            Admission::Masked => {},
+            Admission::AsIs => self.events.send(packet).await,
+            Admission::Legacy => self.events.send(packet.legacy_connection_complete()).await,
         }
     }
 
@@ -1123,7 +1136,11 @@ impl Shared {
     /// event the host masked counts as delivered.
     #[inline]
     pub fn try_push_event(&self, packet: Packet) -> bool {
-        self.state.lock(|cell| cell.borrow().deliver(packet)).is_none_or(|event| self.events.try_send(event).is_ok())
+        match self.state.lock(|cell| cell.borrow().admit(&packet)) {
+            Admission::Masked => true,
+            Admission::AsIs => self.events.try_send(packet).is_ok(),
+            Admission::Legacy => self.events.try_send(packet.legacy_connection_complete()).is_ok(),
+        }
     }
 
     /// Waits until the host passes something to the connection.
