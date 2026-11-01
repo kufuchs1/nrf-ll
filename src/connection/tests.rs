@@ -1355,3 +1355,159 @@ fn without_the_data_length_feature_the_link_stays_at_27_octets() {
     assert_eq!(link.length.effective(), [27, 328, 27, 328]);
     assert_eq!(link.tx_payload_max(), 27);
 }
+
+/// A connection with latency 30 on the current anchor at counter 1000.
+fn latent(csa2: bool) -> Connection {
+    let mut link = connection();
+    if csa2 {
+        link.hopping = Hopping::csa2(0x9A32_8370);
+    }
+    link.latency = 30;
+    link.expect = Expect::Anchor;
+    link.anchor = 5_000_000;
+    link.anchor_counter = 1000;
+    link.counter = 1000;
+    link.last_valid = link.anchor;
+    link.establishment_deadline = None;
+    link
+}
+
+/// The loop top of one event: instants, then the channel.
+fn loop_top(link: &mut Connection, shared: &Shared) -> u8 {
+    link.apply_instants(shared);
+    link.hopping.channel(&link.map, link.counter)
+}
+
+#[test]
+fn a_batch_of_skipped_events_ends_as_the_event_by_event_loop() {
+    for csa2 in [false, true] {
+        for instant in [1001_u16, 1015, 1029, 1030, 1031] {
+            let shared = Shared::new();
+            let (mut one, mut batch) = (latent(csa2), latent(csa2));
+            for link in [&mut one, &mut batch] {
+                link.handle_control(
+                    &[OP_CHANNEL_MAP_IND, 0x0F, 0xF0, 0x00, 0xFF, 0x01, instant as u8, (instant >> 8) as u8],
+                    false,
+                );
+                assert_eq!(link.abort, None);
+            }
+            // Event by event, as before.
+            loop {
+                let _ = loop_top(&mut one, &shared);
+                if one.skipped >= one.latency {
+                    break;
+                }
+                one.skipped += 1;
+                one.stats.skipped += 1;
+                one.counter = one.counter.wrapping_add(1);
+            }
+            // One batch.
+            let _ = loop_top(&mut batch, &shared);
+            let listen = batch.listen_counter();
+            batch.skip_to(listen, &shared);
+            let _ = loop_top(&mut batch, &shared);
+            assert_eq!(
+                (one.counter, one.skipped, one.stats.skipped),
+                (batch.counter, batch.skipped, batch.stats.skipped)
+            );
+            assert_eq!(batch.counter, 1030);
+            assert_eq!(one.channel_update.is_none(), batch.channel_update.is_none());
+            for _ in 0..40 {
+                one.counter = one.counter.wrapping_add(1);
+                batch.counter = batch.counter.wrapping_add(1);
+                assert_eq!(loop_top(&mut one, &shared), loop_top(&mut batch, &shared));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_start_of_a_later_event_matches_its_window() {
+    let mut link = latent(false);
+    for offset in [0_u16, 1, 29, 30, 499] {
+        let counter = 1000_u16.wrapping_add(offset);
+        let start = link.enable_at(counter);
+        link.counter = counter;
+        assert_eq!(link.window().0, start);
+    }
+    // Across the counter and time wrap.
+    let mut link = latent(true);
+    link.anchor = u32::MAX - 20_000;
+    link.anchor_counter = u16::MAX - 1;
+    for offset in [0_u16, 1, 2, 3, 31] {
+        let counter = link.anchor_counter.wrapping_add(offset);
+        let start = link.enable_at(counter);
+        link.counter = counter;
+        assert_eq!(link.window().0, start);
+    }
+}
+
+#[test]
+fn the_first_event_after_a_time_is_found_without_walking_every_event() {
+    for (latency, anchor) in [(30_u16, 5_000_000_u32), (499, u32::MAX - 100_000)] {
+        let mut link = latent(false);
+        link.latency = latency;
+        link.anchor = anchor;
+        let last = link.listen_counter();
+        let first = link.enable_at(link.counter);
+        let end = link.enable_at(last).wrapping_add(20_000);
+        let mut time = first.wrapping_sub(20_000);
+        while time != end {
+            let mut brute = link.counter;
+            while brute != last && reached(time, link.enable_at(brute)) {
+                brute = brute.wrapping_add(1);
+            }
+            assert_eq!(link.first_after(link.counter, last, time), brute, "time {time}");
+            time = time.wrapping_add(997);
+            if end.wrapping_sub(time) < 997 {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_batch_stops_at_the_first_event_the_loop_top_would_end_the_link_at() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    // The supervision deadline falls between the starts of events 1012
+    // and 1013.
+    link.timeout = link.enable_at(1012).wrapping_sub(link.last_valid).wrapping_add(1);
+    let now = link.anchor.wrapping_add(1000);
+    let deadline = link.next_deadline(now, &shared);
+    assert_eq!(deadline, link.last_valid.wrapping_add(link.timeout));
+    let last = link.listen_counter().wrapping_sub(1);
+    let stop = link.first_after(link.counter, last, deadline.wrapping_sub(1));
+    assert_eq!(stop, 1013);
+    assert!(reached(link.enable_at(stop), deadline));
+    assert!(!reached(link.enable_at(stop - 1), deadline));
+    // Waking there passes 1000 to 1013; the loop top at 1014 finds it.
+    let next = link.first_after(link.counter, link.listen_counter(), link.enable_at(stop));
+    assert_eq!(next, 1014);
+    assert!(matches!(link.ended(link.enable_at(stop)), Some(Ended::Lost)));
+}
+
+#[test]
+fn a_ping_point_or_a_reply_deadline_ends_a_batch_early() {
+    let shared = Shared::new();
+    let mut link = latent(false);
+    link.timeout = 32_000_000;
+    let now = link.anchor;
+    link.payload_timer = Some((now, false));
+    let timeout = shared.payload_timeout();
+    assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(timeout - timeout / 4));
+    link.payload_timer = Some((now, true));
+    link.features_request = Request::Requested(now.wrapping_add(1234));
+    assert_eq!(link.next_deadline(now, &shared), now.wrapping_add(1234));
+}
+
+#[test]
+fn a_host_wakeup_inside_a_batch_listens_at_the_first_event_still_ahead() {
+    let link = latent(false);
+    let listen = link.listen_counter();
+    // Between the starts of events 1005 and 1006.
+    let time = link.enable_at(1005).wrapping_add(10);
+    assert_eq!(link.first_after(link.counter, listen, time), 1006);
+    // Before the first start: the current event.
+    assert_eq!(link.first_after(link.counter, listen, link.enable_at(1000).wrapping_sub(1)), 1000);
+}

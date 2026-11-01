@@ -803,6 +803,18 @@ impl Connection {
         self.start_procedures(now, shared);
     }
 
+    /// Radio start of event `counter` on the current anchor: the start
+    /// [`Self::window`] gives once the counter got there without a packet.
+    fn enable_at(&self, counter: u16) -> u32 {
+        let expected =
+            self.anchor.wrapping_add(self.interval.wrapping_mul(u32::from(counter.wrapping_sub(self.anchor_counter))));
+        expected
+            .wrapping_sub(self.widening(expected.wrapping_sub(self.anchor)))
+            .wrapping_sub(self.phy.address_offset_us())
+            .wrapping_sub(RAMP_UP_US)
+            .wrapping_sub(RX_MARGIN_US)
+    }
+
     /// Determines timeouts without allowing received traffic to postpone a
     /// pending local disconnect or the initial connection establishment.
     fn ended(&self, now: u32) -> Option<Ended> {
@@ -1012,6 +1024,23 @@ impl Connection {
         self.encryption.phase = Phase::AwaitingKey { requested: false, rand, ediv };
     }
 
+    /// First event from `from` up to `last` whose radio start is after
+    /// `time`, or `last`. Starts move by at most one interval per event, so
+    /// the whole intervals in between are passed at once.
+    fn first_after(&self, from: u16, last: u16, time: u32) -> u16 {
+        let span = last.wrapping_sub(from);
+        let passed = time.wrapping_sub(self.enable_at(from));
+        if !reached(time, self.enable_at(from)) {
+            return from;
+        }
+        let whole = u16::try_from(passed.checked_div(self.interval).unwrap_or(0)).unwrap_or(u16::MAX).min(span);
+        let mut counter = from.wrapping_add(whole);
+        while counter != last && reached(time, self.enable_at(counter)) {
+            counter = counter.wrapping_add(1);
+        }
+        counter
+    }
+
     /// Drains retained notifications before the final disconnection event.
     pub(crate) async fn flush_after_disconnect(&mut self, shared: &Shared) -> bool {
         for slot in &mut self.notifications {
@@ -1205,6 +1234,10 @@ impl Connection {
         }
     }
 
+    /// Event to listen at after skipping from the current one: as many as
+    /// the latency leaves.
+    const fn listen_counter(&self) -> u16 { self.counter.wrapping_add(self.latency.saturating_sub(self.skipped)) }
+
     /// Loads the next queued control PDU, ACL data from the host or an empty
     /// PDU into [`Self::tx`]. ACL data waits while encryption starts.
     fn load_next(&mut self, shared: &Shared) {
@@ -1330,6 +1363,37 @@ impl Connection {
             phy_status: None,
             preferred_phys: [PREFERRED_PHYS; 2],
         }
+    }
+
+    /// Earliest time at which the loop top acts without a packet or a host
+    /// wakeup: supervision, procedure and reply deadlines, and the ping
+    /// point and expiry of the authenticated payload timeout.
+    fn next_deadline(&self, now: u32, shared: &Shared) -> u32 {
+        let requests = [self.features_request, self.phy_request, self.length_request, self.version_request]
+            .into_iter()
+            .filter_map(|request| if let Request::Requested(deadline) = request { Some(deadline) } else { None });
+        let payload = self.payload_timer.into_iter().flat_map(|(last, pinged)| {
+            let timeout = shared.payload_timeout();
+            let ping = (!pinged).then(|| last.wrapping_add(timeout.saturating_sub(timeout >> 2_u32)));
+            ping.into_iter().chain(core::iter::once(last.wrapping_add(timeout)))
+        });
+        [
+            Some(self.last_valid.wrapping_add(self.timeout)),
+            self.procedure_deadline,
+            self.terminate_deadline,
+            self.establishment_deadline,
+            self.param_request,
+            self.ping_request,
+            self.remote_update,
+            self.remote_request.and_then(|request| request.asked),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(requests)
+        .chain(payload)
+        // A deadline already passed sorts first: the batch then ends at once.
+        .min_by_key(|deadline| deadline.wrapping_sub(now).cast_signed())
+        .unwrap_or_else(|| now.wrapping_add(self.timeout))
     }
 
     /// Copies the next fragment of the host's ACL data into the transmit
@@ -1656,12 +1720,34 @@ impl Connection {
             }
             shared.reset_wakeup();
             if self.skipped < self.latency && self.can_skip(shared) {
-                if clock.idle_until(window.0, shared.wakeup()).await {
-                    self.skipped = self.skipped.saturating_add(1);
-                    self.stats.skipped = self.stats.skipped.wrapping_add(1);
-                    self.counter = self.counter.wrapping_add(1);
+                // One sleep for the whole run of skipped events, ending where
+                // the event-by-event loop would last have woken: at the start
+                // of the last skipped event, or of the first one at or after
+                // a deadline the loop top acts on.
+                let listen = self.listen_counter();
+                let last = listen.wrapping_sub(1);
+                let deadline = self.next_deadline(clock.now(), shared);
+                let stop = self.first_after(self.counter, last, deadline.wrapping_sub(1));
+                let until = self.enable_at(stop);
+                let woken = select(shared.wakeup(), crate::maintenance::requested());
+                let timed_out = clock.idle_until(until, woken).await;
+                crate::health::checkpoint(10);
+                // The RTC1 alarm may end the sleep up to a tick before `until`
+                // on this clock.
+                let now = clock.now();
+                let time = if timed_out && !reached(now, until) { until } else { now };
+                // Events whose radio start passed during the sleep are skipped.
+                let next = self.first_after(self.counter, listen, time);
+                if next != self.counter {
+                    self.skip_to(next, shared);
+                    if !timed_out {
+                        // As before: the host's data goes out at the next
+                        // event.
+                        self.skipped = self.latency;
+                    }
                     continue;
                 }
+                // Woken before the current event: listen at it, as before.
                 self.skipped = self.latency;
             }
             clock.sleep_until(window.0, pending::<()>()).await;
@@ -1773,6 +1859,21 @@ impl Connection {
     /// link: the longest payload and time this side may send.
     pub(crate) const fn set_suggested_length(&mut self, length: [u16; 2]) { self.length = DataLength::new(length); }
 
+    /// Passes the events from the current one up to `to` without listening,
+    /// as the loop does one at a time: the current event's channel and
+    /// instants were taken at the loop top, every further one's here.
+    fn skip_to(&mut self, to: u16, shared: &Shared) {
+        while self.counter != to {
+            self.skipped = self.skipped.saturating_add(1);
+            self.stats.skipped = self.stats.skipped.wrapping_add(1);
+            self.counter = self.counter.wrapping_add(1);
+            if self.counter != to {
+                self.apply_instants(shared);
+                _ = self.hopping.channel(&self.map, self.counter);
+            }
+        }
+    }
+
     /// Answers an encryption request: sends the peripheral's session key
     /// diversifier and IV and asks the host for the long term key.
     fn start_encryption(&mut self, params: &[u8]) {
@@ -1864,10 +1965,15 @@ impl Connection {
     }
 
     /// Radio start and access address deadline of the current event.
-    fn window(&self) -> (u32, u32) {
+    fn window(&self) -> (u32, u32) { self.window_at(self.counter) }
+
+    /// Radio start and access address deadline of event `counter`.
+    fn window_at(&self, counter: u16) -> (u32, u32) {
         let (earliest, latest) = match self.expect {
             Expect::Anchor => {
-                let expected = self.expected_anchor();
+                let expected = self
+                    .anchor
+                    .wrapping_add(self.interval.wrapping_mul(u32::from(counter.wrapping_sub(self.anchor_counter))));
                 (expected, expected)
             },
             Expect::Window { start, size } => {
