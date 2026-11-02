@@ -612,7 +612,9 @@ impl<'peripherals> Clock<'peripherals> {
     /// clock sources of the board: the crystal frequency is set here, so
     /// nothing else may start the crystal before; keep Embassy's
     /// `hfclk_source` internal. [`calibrate_rc`] waits for it. The clock
-    /// starts paused.
+    /// starts paused. Build only one clock: a second one with another
+    /// configuration would change the crystal frequency under the running
+    /// crystal, and `calibrate_rc` keeps the first configuration.
     #[cfg(feature = "nrf51")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
