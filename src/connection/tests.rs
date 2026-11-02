@@ -2,7 +2,11 @@
 
 use super::*;
 
-fn connection() -> Connection {
+/// A new connection. It is built in a critical section, which a test that
+/// changes the sleep clock all tests share holds meanwhile.
+fn connection() -> Connection { critical_section::with(|_| new_connection()) }
+
+fn new_connection() -> Connection {
     Connection::new(
         &ConnectInd {
             access_address:   0x9A32_8370,
@@ -353,6 +357,22 @@ fn window_widening_stops_at_half_the_interval_less_the_interframe_space() {
     assert_eq!(link.interval, 15_000);
     assert_eq!(link.widening(1_000_000), 1016);
     assert_eq!(link.widening(60_000_000), 7350);
+}
+
+#[cfg(feature = "nrf51")]
+#[test]
+fn a_low_frequency_crystal_sets_the_sleep_clock_accuracy_of_the_link() {
+    use crate::clock::LowFrequency;
+    let (crystal, rc) = critical_section::with(|_| {
+        chip::set_sleep_clock(LowFrequency::Crystal { ppm: 20 });
+        let crystal = new_connection();
+        chip::set_sleep_clock(LowFrequency::Rc);
+        (crystal, new_connection())
+    });
+    assert_eq!(crystal.sca_ppm, 520);
+    assert_eq!(crystal.widening(1_000_000), 536);
+    assert_eq!(rc.sca_ppm, 1000);
+    assert_eq!(rc.widening(1_000_000), 1016);
 }
 
 #[test]

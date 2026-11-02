@@ -133,8 +133,9 @@ and its radio lacks parts of the nRF52832's:
 - **Radio trim:** after powering the radio the link layer copies its BLE 1 Mbit trim values from FICR when FICR asks
   for it.
 - **Clocks:** the firmware tells the link layer which crystals the board has, with `Clock::with_config`, before
-  anything starts the high frequency crystal: keep Embassy's `hfclk_source` internal and create the clock before
-  spawning `calibrate_rc`. `Clock::new` takes the defaults, a 16 MHz crystal and the RC oscillator.
+  anything else starts the high frequency crystal: keep Embassy's `hfclk_source` internal. `Clock::new` takes the
+  defaults, a 16 MHz crystal and the RC oscillator. `calibrate_rc` waits until either has run, so it may be spawned
+  before the clock is created: it starts the crystal only once its frequency is set.
 
   ```rust
   use nrf_ll::clock::{self, Clock, HighFrequency, LowFrequency};
@@ -146,8 +147,8 @@ and its radio lacks parts of the nRF52832's:
 
   The crystal frequency goes to `CLOCK.XTALFREQ`, whose reset value comes from `UICR.XTALFREQ`. With the RC oscillator
   `calibrate_rc` runs as on the nRF52832 and the link layer counts on 500 ppm; with a 32.768 kHz crystal, which the
-  firmware starts through Embassy's `lfclk_source`, it counts on the accuracy given, and `calibrate_rc` does not
-  calibrate.
+  firmware starts through Embassy's `lfclk_source`, it counts on the accuracy given, and `calibrate_rc` waits forever
+  without calibrating.
 - **Interrupts:** bind the link layer's interrupt executor to `SWI0` (there is no `EGU0_SWI0`). The Cortex-M0 has two
   priority bits, but Embassy builds the nRF51 with three, so `P0` and `P1`, `P2` and `P3`, `P4` and `P5`, and `P6` and
   `P7` are the same level: the link layer must be at least two steps above everything else, such as `P2` with the other

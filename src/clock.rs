@@ -111,6 +111,14 @@ pub const SETUP_US: u32 = 300;
 /// Shortest wait for which TIMER0 and the crystal stop.
 const SLEEP_MIN_US: u32 = 3000;
 
+// The channels standing in for the FORK of the self-disabling channels on
+// the nRF51 must be programmable channels that nothing else here uses.
+#[cfg(feature = "nrf51")]
+const _: () = assert!(
+    chip::forks_are_free(&[PPI_SYNC, PPI_CALIBRATE], &[PPI_RESUME, PPI_SYNC, PPI_CALIBRATE]),
+    "a FORK stand-in channel is taken or not programmable"
+);
+
 /// Number of users that need the high frequency crystal. The count and the
 /// start or stop task change together in a critical section: a release that
 /// counted down to zero but was preempted before stopping the crystal would
@@ -602,9 +610,9 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Sets up the timer, the RTC and the capture channels, and takes the
     /// clock sources of the board: the crystal frequency is set here, so
-    /// nothing may start the crystal before, neither Embassy (keep its
-    /// `hfclk_source` internal) nor [`calibrate_rc`]. The clock starts
-    /// paused.
+    /// nothing else may start the crystal before; keep Embassy's
+    /// `hfclk_source` internal. [`calibrate_rc`] waits for it. The clock
+    /// starts paused.
     #[cfg(feature = "nrf51")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
@@ -617,9 +625,14 @@ impl<'peripherals> Clock<'peripherals> {
 /// The address of a register for a PPI endpoint.
 fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
-/// Keeps the low frequency RC oscillator within 500 ppm forever. On an
-/// nRF51 whose [`Config`] names a crystal as the low frequency clock, it
-/// waits forever without calibrating.
+/// Keeps the low frequency RC oscillator within 500 ppm forever.
+///
+/// On the nRF51 it first waits until [`Clock::new`] or [`Clock::with_config`]
+/// took the board's clock sources, so it may be spawned before the clock is
+/// built: it starts the crystal only once its frequency is set, and decides
+/// from the [`Config`] whether to calibrate. With a crystal as the low
+/// frequency clock it then waits forever without calibrating; without a
+/// clock it waits forever.
 ///
 /// Owns TEMP exclusively. The TEMP data-ready interrupt (calling
 /// [`on_temperature_interrupt`]) and the `CLOCK_POWER` interrupt (calling
@@ -633,7 +646,7 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 #[inline]
 pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {
     #[cfg(feature = "nrf51")]
-    if !chip::calibrates_rc() {
+    if !chip::calibrates_rc().await {
         info!("the low frequency clock is a crystal: no RC calibration");
         loop {
             pending::<()>().await;
