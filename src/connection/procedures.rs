@@ -41,6 +41,7 @@ use super::{
     tx_power,
 };
 use crate::{
+    chip,
     clock::reached,
     hci::{ConnectionParams, Packet, Shared},
     log::info,
@@ -49,6 +50,11 @@ use crate::{
     radio::Phy,
 };
 
+/// Highest transmit power in dBm.
+const MAX_POWER_DBM: i8 = match LEVELS_DBM.last() {
+    Some(&dbm) => dbm,
+    None => 0,
+};
 /// Acceptable power reduction when no packet has been measured yet.
 const UNKNOWN_REDUCTION: u8 = 0xFF;
 /// Error code: different transaction collision, another procedure with an
@@ -289,6 +295,13 @@ impl Connection {
     /// Answers the PDUs of the PHY update procedure.
     pub(super) fn handle_phy(&mut self, code: u8, params: &[u8]) {
         if code == OP_PHY_REQ {
+            if !chip::PHY_2M {
+                // With LE 1M alone the PHY update procedure is not
+                // supported (Core, Vol 6, Part B, 5.1.10): the central
+                // learns it as for any unknown PDU.
+                self.enqueue(Llid::Control, &[OP_UNKNOWN_RSP, OP_PHY_REQ]);
+                return;
+            }
             if field::<2>(params, 0).is_none_or(|[tx, rx]| tx.trailing_zeros() >= 2 || rx.trailing_zeros() >= 2) {
                 self.enqueue(Llid::Control, &[OP_REJECT_EXT_IND, OP_PHY_REQ, ERROR_UNSUPPORTED_VALUE]);
                 return;
@@ -362,7 +375,8 @@ impl Connection {
         };
         // Round upward to the lowest available power at least as high as
         // requested.
-        let requested_level = LEVELS_DBM.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(4);
+        let requested_level =
+            LEVELS_DBM.iter().copied().find(|&level| i32::from(level) >= requested).unwrap_or(MAX_POWER_DBM);
         for_phy_mut(&mut self.power, request_phy).move_to(i32::from(requested_level));
         self.power_reporting |= phy;
         let level = for_phy_mut(&mut self.power, request_phy).level();
@@ -487,12 +501,19 @@ impl Connection {
             }
             self.enqueue(Llid::Control, &request);
             self.features_request = Request::Requested(deadline);
-        } else if (self.host_phy.is_some() || (encrypted && self.phy == Phy::M1))
+        } else if (self.host_phy.is_some() || (chip::PHY_2M && encrypted && self.phy == Phy::M1))
             && self.phy_request == Request::NotStarted
         {
-            let [tx, rx] = self.preferred_phys;
-            self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
-            self.phy_request = Request::Requested(deadline);
+            if chip::PHY_2M {
+                let [tx, rx] = self.preferred_phys;
+                self.enqueue(Llid::Control, &[OP_PHY_REQ, tx, rx]);
+                self.phy_request = Request::Requested(deadline);
+            } else {
+                // With LE 1M alone there is no PHY update procedure: the
+                // host's request completes at once, on LE 1M.
+                self.phy_request = Request::Done;
+                self.phy_status = Some(STATUS_SUCCESS);
+            }
         } else if self.length.local_tx != self.length.announced_tx
             && !self.length.unsupported
             && self.central_features.is_none_or(|[first, ..]| first & FEATURE_DATA_LENGTH != 0)

@@ -62,10 +62,18 @@ const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 ///
 /// LE encryption, the connection parameters request procedure, the extended
 /// reject indication, the peripheral-initiated feature exchange and LE ping
-/// (bits 0 to 4), the LE 2M PHY (bit 8), channel selection algorithm 2 (bit
-/// 14) and LE power control (bits 33 and 34).
-pub const FEATURES: [u8; 8] =
-    [0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 }, 0x41, 0, 0, 0x06, 0, 0, 0];
+/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, channel
+/// selection algorithm 2 (bit 14) and LE power control (bits 33 and 34).
+pub const FEATURES: [u8; 8] = [
+    0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 },
+    if chip::PHY_2M { 0x41 } else { 0x40 },
+    0,
+    0,
+    0x06,
+    0,
+    0,
+    0,
+];
 /// Feature bit in the first octet: LE data packet length extension.
 const FEATURE_DATA_LENGTH: u8 = 0x20;
 /// Longest time on the air of a data PDU the specification allows.
@@ -128,8 +136,9 @@ const OP_PHY_REQ: u8 = 0x16;
 const OP_PHY_RSP: u8 = 0x17;
 /// PHY change at an instant.
 const OP_PHY_UPDATE_IND: u8 = 0x18;
-/// PHYs this side prefers for both directions: LE 2M.
-const PREFERRED_PHYS: u8 = 0x02;
+/// PHYs this side prefers for both directions: LE 2M where the radio has
+/// it.
+const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
 /// Interval of the connection statistics log.
 const REPORT_INTERVAL_US: u32 = 10_000_000;
 /// Header bit: more data follows.

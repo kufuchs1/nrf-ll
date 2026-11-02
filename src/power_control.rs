@@ -19,8 +19,11 @@
 //! maximum once and never again, which a permanent floor would keep for the
 //! whole connection. A later request of the central sets a new floor.
 
-/// Transmit power levels in dBm, lowest first.
-pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
+use crate::chip;
+
+/// Transmit power levels in dBm, lowest first: -20 to +4 dBm, with +3 dBm
+/// on the nRF52832.
+pub const LEVELS_DBM: [i8; chip::LEVELS_DBM.len()] = chip::LEVELS_DBM;
 /// Level at the start of a connection and for advertising: 0 dBm.
 pub const DEFAULT_LEVEL: usize = 5;
 /// Estimated signal at the central above which the power steps down.
@@ -145,6 +148,16 @@ mod tests {
         for _ in 0..u32::from(SAMPLES_PER_DECISION) * 20 {
             control.on_packet(rssi);
         }
+    }
+
+    #[test]
+    fn every_level_is_a_radio_setting_and_the_default_is_0_dbm() {
+        assert_eq!(LEVELS_DBM[DEFAULT_LEVEL], 0);
+        assert!(LEVELS_DBM.is_sorted());
+        for level in LEVELS_DBM {
+            assert_eq!(chip::txpower(level).to_bits().cast_signed(), level);
+        }
+        assert_eq!(LEVELS_DBM.contains(&3), cfg!(feature = "nrf52832"));
     }
 
     #[test]

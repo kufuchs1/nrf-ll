@@ -27,6 +27,9 @@ pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
 /// Busy-wait iterations for a decryption to finish after the packet end,
 /// about 250 us at 64 MHz.
 pub const DECRYPT_WAIT: u32 = 2000;
+/// Transmit power levels in dBm, lowest first: the radio's levels from
+/// -20 dBm up.
+pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
 /// Largest payload the radio accepts on any channel.
 const MAX_PAYLOAD: u8 = 255;
 /// Whether the radio has LE 2M.

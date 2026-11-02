@@ -37,6 +37,9 @@ pub const DECRYPT_WAIT: u32 = 400;
 /// Programmable PPI channels above a channel that its stand-in for FORK
 /// uses: the nRF51 has 16 programmable channels and no FORK.
 const FORK_OFFSET: usize = 8;
+/// Transmit power levels in dBm, lowest first: the radio's levels from
+/// -20 dBm up, without the +3 dBm of the nRF52832.
+pub const LEVELS_DBM: [i8; 7] = [-20, -16, -12, -8, -4, 0, 4];
 /// Whether the radio has LE 2M.
 pub const PHY_2M: bool = false;
 /// Receiver ready time after RXEN, without a fast ramp-up: about 140 us.
@@ -155,3 +158,17 @@ pub const fn txpower(dbm: i8) -> Txpower {
 
 /// The address of a register for a PPI endpoint.
 fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_power_between_levels_rounds_down_to_one() {
+        assert!(txpower(3) == Txpower::_0dBm);
+        assert!(txpower(-1) == Txpower::Neg4dBm);
+        assert!(txpower(i8::MAX) == Txpower::Pos4dBm);
+        assert!(txpower(-21) == Txpower::Neg30dBm);
+        assert!(txpower(i8::MIN) == Txpower::Neg30dBm);
+    }
+}

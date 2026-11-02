@@ -67,13 +67,14 @@ impl Phy {
         }
     }
 
-    /// The PHY of a link layer PHY bit field with exactly one of 1M and 2M.
+    /// The PHY of a link layer PHY bit field with exactly one of 1M and 2M,
+    /// if the radio has it: the nRF51 has LE 1M alone.
     #[inline]
     #[must_use = "the PHY is only decoded"]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         match bits {
             1 => Some(Self::M1),
-            2 => Some(Self::M2),
+            2 if chip::PHY_2M => Some(Self::M2),
             _ => None,
         }
     }
