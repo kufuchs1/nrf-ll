@@ -9,6 +9,7 @@ use crate::{log::info, sleep};
 use core::{
     cell::Cell,
     future::{Future, poll_fn},
+    ptr::{with_exposed_provenance_mut, write_volatile},
     task::Poll,
 };
 use embassy_futures::select::{Either, select};
@@ -20,7 +21,6 @@ use embassy_nrf::{
         RTC0 as RTC,
         TEMP,
         TIMER0 as REGS,
-        clock::vals::HfclkstatSrc,
         timer::vals::{Bitmode, Mode},
     },
     peripherals::{RTC0, TIMER0},
@@ -46,9 +46,22 @@ const CC_START: usize = 0;
 /// Time after which a calibration whose crystal or end never came is given
 /// up until the next interval.
 const CALIBRATION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Register of the workaround for nRF52832 anomaly 192: the RC oscillator's
+/// frequency can be off by more than 500 ppm after a calibration during
+/// which the CPU slept.
+const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
 /// Programmable PPI channel: CLOCK HFCLKSTARTED to CLOCK CAL, while a
 /// calibration waits for the crystal.
 const PPI_CALIBRATE: usize = 3;
+/// PPI channel group of [`PPI_CALIBRATE`] alone, which its first event
+/// disables: HFCLKSTARTED may come twice (nRF52832 anomaly 201), and the
+/// second would start the calibration again.
+const PPI_GROUP_CALIBRATE: usize = 0;
+/// PPI channel group of [`PPI_SYNC`] alone, which its first event disables:
+/// RTC0 may generate a compare event twice while the CPU reads the RTC
+/// (nRF52832 anomaly 179), and the second capture would overwrite the time
+/// taken at the first.
+const PPI_GROUP_SYNC: usize = 1;
 /// Wakes the calibration when the clock interrupt reports it done.
 static CALIBRATION_DONE: AtomicWaker = AtomicWaker::new();
 /// Wakes the radio task when the high frequency crystal has started.
@@ -126,9 +139,11 @@ struct Calibration;
 
 impl Drop for Calibration {
     fn drop(&mut self) {
+        PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().write_value(1);
         PPI.chenclr().write(|w| w.set_ch(PPI_CALIBRATE, true));
         CLOCK.intenclr().write(|w| w.set_done(true));
         CLOCK.events_done().write_value(0);
+        set_anomaly_192(false);
         release_crystal();
     }
 }
@@ -338,6 +353,8 @@ impl<'peripherals> Clock<'peripherals> {
         let ch_sync = PPI.ch(PPI_SYNC);
         ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
         ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
+        PPI.chg(PPI_GROUP_SYNC).write(|w| w.set_ch(PPI_SYNC, true));
+        PPI.fork(PPI_SYNC).tep().write_value(address(PPI.tasks_chg(PPI_GROUP_SYNC).dis().as_ptr()));
         PPI.chenset().write(|w| {
             w.set_ch(PPI_ADDRESS, true);
             w.set_ch(PPI_END, true);
@@ -363,7 +380,8 @@ impl<'peripherals> Clock<'peripherals> {
             return;
         }
         self.cancel_start();
-        PPI.chenset().write(|w| w.set_ch(PPI_SYNC, true));
+        // Enables PPI_SYNC until its first compare event.
+        PPI.tasks_chg(PPI_GROUP_SYNC).en().write_value(1);
         let tick = loop {
             let tick = rtc_now().wrapping_add(RTC_MIN_TICKS) & RTC_MASK;
             RTC.cc(RTC_SYNC).write(|w| w.set_compare(tick));
@@ -540,15 +558,20 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
 /// [`CALIBRATION_TIMEOUT`] if the crystal or the end never comes.
 async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
+    set_anomaly_192(true);
     let channel = PPI.ch(PPI_CALIBRATE);
     channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
     channel.tep().write_value(address(CLOCK.tasks_cal().as_ptr()));
-    PPI.chenset().write(|w| w.set_ch(PPI_CALIBRATE, true));
+    PPI.chg(PPI_GROUP_CALIBRATE).write(|w| w.set_ch(PPI_CALIBRATE, true));
+    PPI.fork(PPI_CALIBRATE).tep().write_value(address(PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().as_ptr()));
+    // Enables PPI_CALIBRATE until the crystal's first start event.
+    PPI.tasks_chg(PPI_GROUP_CALIBRATE).en().write_value(1);
     request_crystal();
     let _calibration = Calibration;
     // A crystal that already ran reports no start. If it starts just now
     // as well, the second start of the calibration is harmless.
     if crystal_running() {
+        PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().write_value(1);
         CLOCK.tasks_cal().write_value(1);
     }
     with_timeout(CALIBRATION_TIMEOUT, calibration_done()).await.is_ok()
@@ -615,11 +638,11 @@ async fn temperature() -> i32 {
     .await
 }
 
-/// Whether the high frequency clock runs from the crystal.
-fn crystal_running() -> bool {
-    let status = CLOCK.hfclkstat().read();
-    status.state() && status.src() == HfclkstatSrc::Xtal
-}
+/// Whether the high frequency crystal runs: whether it reported its start
+/// since it was last started. HFCLKSTAT may be wrong once the crystal has
+/// started (nRF52832 anomaly 201), so it is not read; the event stays set
+/// until the crystal stops.
+fn crystal_running() -> bool { CLOCK.events_hfclkstarted().read() != 0 }
 
 /// Whether a wrapping difference is a positive time.
 const fn is_ahead(difference: u32) -> bool { difference > 0 && difference < u32::MAX >> 1 }
@@ -636,8 +659,17 @@ fn release_crystal() {
         users.set(left);
         if left == 0 {
             CLOCK.tasks_hfclkstop().write_value(1);
+            CLOCK.events_hfclkstarted().write_value(0);
         }
     });
+}
+
+/// Sets the workaround for nRF52832 anomaly 192 while an RC calibration may
+/// run, and clears it after.
+fn set_anomaly_192(calibrating: bool) {
+    let register = with_exposed_provenance_mut::<u32>(ANOMALY_192_REGISTER);
+    // SAFETY: Nordic documents these writes for the anomaly 192 workaround.
+    let () = unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) };
 }
 
 /// Adds a user of the high frequency crystal and starts it for the first.

@@ -98,7 +98,11 @@ The random delay of each advertising event and the entropy of each encryption st
 other tasks run: bind and enable `RNG` to `rng::on_interrupt`.
 
 The RC oscillator is calibrated when the temperature changed by 0.5 °C, at the latest every 8 s: PPI starts the calibration
-once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling.
+once the crystal runs and the clock interrupt reports the end, so the CPU wakes twice instead of polling. Following
+the nRF52832 errata, the calibration runs with the anomaly 192 workaround set, the channel starting it disables itself
+after the first crystal start event, which may come twice (anomaly 201), and the crystal counts as running once it
+reported its start, without reading `HFCLKSTAT`. The channel capturing the timer at an RTC tick disables itself after the
+first compare event too, which may also come twice (anomaly 179).
 `clock::calibrate_rc` takes the `TEMP` peripheral and is driven by interrupts only: bind and enable `TEMP` to
 `clock::on_temperature_interrupt` and `CLOCK_POWER` to `clock::on_clock_interrupt`, or it waits forever for its first
 temperature. A calibration whose crystal or end does not come within 100 ms is retried at the next interval.
