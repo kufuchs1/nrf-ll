@@ -1,4 +1,4 @@
 [toolchain]
 channel = "nightly"
-targets = ["thumbv7em-none-eabihf"]
+targets = ["thumbv7em-none-eabihf", "thumbv6m-none-eabi"]
 components = ["clippy", "rustfmt"]

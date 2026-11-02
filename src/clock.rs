@@ -5,7 +5,9 @@
 //! keeps the time on the low frequency clock and restarts TIMER0 at an exact
 //! tick before the next event.
 
-use crate::{log::info, sleep};
+use crate::{chip, log::info, sleep};
+#[cfg(feature = "nrf51")]
+use core::future::pending;
 use core::{
     cell::Cell,
     future::{Future, poll_fn},
@@ -20,7 +22,6 @@ use embassy_nrf::{
         RTC0 as RTC,
         TEMP,
         TIMER0 as REGS,
-        clock::vals::HfclkstatSrc,
         timer::vals::{Bitmode, Mode},
     },
     peripherals::{RTC0, TIMER0},
@@ -49,6 +50,15 @@ const CALIBRATION_TIMEOUT: Duration = Duration::from_millis(100);
 /// Programmable PPI channel: CLOCK HFCLKSTARTED to CLOCK CAL, while a
 /// calibration waits for the crystal.
 const PPI_CALIBRATE: usize = 3;
+/// PPI channel group of [`PPI_CALIBRATE`] alone, which its first event
+/// disables: HFCLKSTARTED may come twice (nRF52832 anomaly 201), and the
+/// second would start the calibration again.
+const PPI_GROUP_CALIBRATE: usize = 0;
+/// PPI channel group of [`PPI_SYNC`] alone, which its first event disables:
+/// RTC0 may generate a compare event twice while the CPU reads the RTC
+/// (nRF52832 anomaly 179), and the second capture would overwrite the time
+/// taken at the first.
+const PPI_GROUP_SYNC: usize = 1;
 /// Wakes the calibration when the clock interrupt reports it done.
 static CALIBRATION_DONE: AtomicWaker = AtomicWaker::new();
 /// Wakes the radio task when the high frequency crystal has started.
@@ -59,9 +69,9 @@ static TEMPERATURE_READY: AtomicWaker = AtomicWaker::new();
 const CRYSTAL_RETRY_US: u32 = 2000;
 /// Time the high frequency crystal gets to start before TIMER0 restarts, at
 /// first. It then follows the crystal: see [`Clock::lead`].
-const CRYSTAL_LEAD_US: u32 = 800;
+const CRYSTAL_LEAD_US: u32 = chip::CRYSTAL_LEAD_US;
 /// Bounds of the crystal lead time.
-const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
+const CRYSTAL_LEAD_RANGE_US: (u32, u32) = chip::CRYSTAL_LEAD_RANGE_US;
 /// Lead time given up after a restart whose crystal ran early. With the
 /// step up, it sets how many restarts find the crystal late once the lead
 /// settled: 2 / (2 + 100), about 2 %.
@@ -92,11 +102,22 @@ const RTC_SYNC: usize = 1;
 const RTC_MASK: u32 = 0x00FF_FFFF;
 /// Smallest distance from the current RTC tick a compare event needs.
 const RTC_MIN_TICKS: u32 = 2;
+/// Accuracy of the RC oscillator in ppm, which [`calibrate_rc`] keeps it
+/// within.
+pub const RC_PPM: u32 = 500;
 /// Time from the TIMER0 restart until the time slept for: how early
 /// [`Clock::sleep_until`] returns, for the caller to program a radio start.
 pub const SETUP_US: u32 = 300;
 /// Shortest wait for which TIMER0 and the crystal stop.
 const SLEEP_MIN_US: u32 = 3000;
+
+// The channels standing in for the FORK of the self-disabling channels on
+// the nRF51 must be programmable channels that nothing else here uses.
+#[cfg(feature = "nrf51")]
+const _: () = assert!(
+    chip::forks_are_free(&[PPI_SYNC, PPI_CALIBRATE], &[PPI_RESUME, PPI_SYNC, PPI_CALIBRATE]),
+    "a FORK stand-in channel is taken or not programmable"
+);
 
 /// Number of users that need the high frequency crystal. The count and the
 /// start or stop task change together in a critical section: a release that
@@ -121,14 +142,82 @@ pub struct Clock<'peripherals> {
     paused: Option<(u32, u32)>,
 }
 
+/// The clock sources of an nRF51 board, which only its firmware knows: the
+/// high frequency crystal's frequency and the low frequency clock. The
+/// default is a 16 MHz crystal and the RC oscillator.
+#[cfg(feature = "nrf51")]
+#[derive(Clone, Copy)]
+pub struct Config {
+    /// Frequency of the high frequency crystal.
+    high_frequency: HighFrequency,
+    /// The low frequency clock RTC0 runs on.
+    low_frequency:  LowFrequency,
+}
+
+#[cfg(feature = "nrf51")]
+impl Config {
+    /// With a high frequency crystal of `high_frequency`.
+    #[inline]
+    #[must_use = "the configuration is only built"]
+    pub const fn high_frequency(self, high_frequency: HighFrequency) -> Self { Self { high_frequency, ..self } }
+
+    /// With `low_frequency` as the low frequency clock.
+    #[inline]
+    #[must_use = "the configuration is only built"]
+    pub const fn low_frequency(self, low_frequency: LowFrequency) -> Self { Self { low_frequency, ..self } }
+
+    /// A 16 MHz crystal and the RC oscillator.
+    #[inline]
+    #[must_use = "the configuration is only built"]
+    pub const fn new() -> Self { Self { high_frequency: HighFrequency::Mhz16, low_frequency: LowFrequency::Rc } }
+}
+
+#[cfg(feature = "nrf51")]
+impl Default for Config {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
+
+/// Frequency of the nRF51's high frequency crystal. CLOCK.XTALFREQ must
+/// match it before the crystal starts, or the radio is off frequency.
+#[cfg(feature = "nrf51")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HighFrequency {
+    /// 16 MHz, the default of an erased UICR.
+    Mhz16,
+    /// 32 MHz.
+    Mhz32,
+}
+
+/// The low frequency clock RTC0 runs on, which sets the sleep clock accuracy
+/// the receive windows widen for. The firmware starts it, as configured in
+/// Embassy.
+#[cfg(feature = "nrf51")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LowFrequency {
+    /// A 32.768 kHz crystal, at most `ppm` off, which needs no calibration.
+    /// The Bluetooth specification allows up to 500 ppm.
+    Crystal {
+        /// Accuracy in ppm.
+        ppm: u16,
+    },
+    /// The internal RC oscillator, which [`calibrate_rc`] keeps within
+    /// [`RC_PPM`].
+    Rc,
+}
+
 /// Undoes a calibration's setup when it completes or its future is dropped.
 struct Calibration;
 
 impl Drop for Calibration {
     fn drop(&mut self) {
-        PPI.chenclr().write(|w| w.set_ch(PPI_CALIBRATE, true));
+        PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().write_value(1);
+        chip::disable_channel(PPI_CALIBRATE);
         CLOCK.intenclr().write(|w| w.set_done(true));
         CLOCK.events_done().write_value(0);
+        chip::set_calibration_workaround(false);
         release_crystal();
     }
 }
@@ -181,7 +270,8 @@ impl Drop for ResumeGuard<'_, '_> {
         PPI.chenclr().write(|w| w.set_ch(PPI_RESUME, true));
         self.clock.cancel_start();
         REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78).
+        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
+        // nRF51 only SHUTDOWN powers the timer down.
         REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         RTC.events_compare(RTC_RESUME).write_value(0);
@@ -307,43 +397,27 @@ impl<'peripherals> Clock<'peripherals> {
 
     /// Time the crystal currently gets to start before an event. It shrinks
     /// by 2 us while the crystal runs at least 100 us before TIMER0
-    /// restarts and grows by 100 us when it was late, within 300 to 1500 us.
+    /// restarts and grows by 100 us when it was late, within 300 to 1500 us,
+    /// or to 2500 us on the nRF51.
     #[inline]
     #[must_use = "the lead time is only read"]
     pub const fn lead(&self) -> u32 { self.lead }
 
-    /// Sets up the timer, the RTC and the capture channels. The clock starts
-    /// paused.
+    /// Sets up the timer, the RTC and the capture channels, for the default
+    /// clock sources of [`Config`]. The clock starts paused.
+    #[cfg(feature = "nrf51")]
     #[inline]
     #[must_use = "the clock stops being usable once dropped"]
     pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self {
-        REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78).
-        REGS.tasks_shutdown().write_value(1);
-        REGS.mode().write(|w| w.set_mode(Mode::Timer));
-        REGS.bitmode().write(|w| w.set_bitmode(Bitmode::_32bit));
-        REGS.prescaler().write(|w| w.set_prescaler(PRESCALER_1MHZ));
-        REGS.tasks_clear().write_value(1);
-        RTC.tasks_stop().write_value(1);
-        RTC.prescaler().write(|w| w.set_prescaler(0));
-        RTC.evtenset().write(|w| {
-            w.set_compare(RTC_RESUME, true);
-            w.set_compare(RTC_SYNC, true);
-        });
-        RTC.tasks_clear().write_value(1);
-        RTC.tasks_start().write_value(1);
-        let ch_resume = PPI.ch(PPI_RESUME);
-        ch_resume.eep().write_value(address(RTC.events_compare(RTC_RESUME).as_ptr()));
-        ch_resume.tep().write_value(address(REGS.tasks_start().as_ptr()));
-        let ch_sync = PPI.ch(PPI_SYNC);
-        ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
-        ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
-        PPI.chenset().write(|w| {
-            w.set_ch(PPI_ADDRESS, true);
-            w.set_ch(PPI_END, true);
-        });
-        Self { _rtc: rtc, _timer: timer, base: 0, late: 0, lead: CRYSTAL_LEAD_US, paused: Some((rtc_now(), 0)) }
+        Self::with_config(timer, rtc, Config::new())
     }
+
+    /// Sets up the timer, the RTC and the capture channels. The clock starts
+    /// paused.
+    #[cfg(feature = "nrf52832")]
+    #[inline]
+    #[must_use = "the clock stops being usable once dropped"]
+    pub fn new(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self { Self::setup(timer, rtc) }
 
     /// The current time. While paused it follows the RTC, to about 30 us.
     #[inline]
@@ -363,7 +437,8 @@ impl<'peripherals> Clock<'peripherals> {
             return;
         }
         self.cancel_start();
-        PPI.chenset().write(|w| w.set_ch(PPI_SYNC, true));
+        // Enables PPI_SYNC until its first compare event.
+        PPI.tasks_chg(PPI_GROUP_SYNC).en().write_value(1);
         let tick = loop {
             let tick = rtc_now().wrapping_add(RTC_MIN_TICKS) & RTC_MASK;
             RTC.cc(RTC_SYNC).write(|w| w.set_compare(tick));
@@ -373,10 +448,11 @@ impl<'peripherals> Clock<'peripherals> {
                 break tick;
             }
         };
-        PPI.chenclr().write(|w| w.set_ch(PPI_SYNC, true));
+        chip::disable_channel(PPI_SYNC);
         let time = self.base.wrapping_add(REGS.cc(CC_NOW).read());
         REGS.tasks_stop().write_value(1);
-        // STOP alone keeps drawing current (nRF52832 anomaly 78).
+        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
+        // nRF51 only SHUTDOWN powers the timer down.
         REGS.tasks_shutdown().write_value(1);
         REGS.tasks_clear().write_value(1);
         release_crystal();
@@ -402,6 +478,41 @@ impl<'peripherals> Clock<'peripherals> {
         PPI.chenset().write(|w| w.set_ch(PPI_RESUME, true));
         restart.clock.finish_resume(tick, time, ticks, started).await;
         restart.finish();
+    }
+
+    /// Sets up the timer, the RTC and the capture channels.
+    #[inline]
+    fn setup(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>) -> Self {
+        REGS.tasks_stop().write_value(1);
+        // STOP alone keeps drawing current (nRF52832 anomaly 78), and on the
+        // nRF51 only SHUTDOWN powers the timer down.
+        REGS.tasks_shutdown().write_value(1);
+        REGS.mode().write(|w| w.set_mode(Mode::Timer));
+        REGS.bitmode().write(|w| w.set_bitmode(Bitmode::_32bit));
+        REGS.prescaler().write(|w| w.set_prescaler(PRESCALER_1MHZ));
+        REGS.tasks_clear().write_value(1);
+        RTC.tasks_stop().write_value(1);
+        RTC.prescaler().write(|w| w.set_prescaler(0));
+        RTC.evtenset().write(|w| {
+            w.set_compare(RTC_RESUME, true);
+            w.set_compare(RTC_SYNC, true);
+        });
+        RTC.tasks_clear().write_value(1);
+        // TODO(errata): the nRF51 may need a wait for the counter to change
+        // after START before it is read; check the nRF51802 errata.
+        RTC.tasks_start().write_value(1);
+        let ch_resume = PPI.ch(PPI_RESUME);
+        ch_resume.eep().write_value(address(RTC.events_compare(RTC_RESUME).as_ptr()));
+        ch_resume.tep().write_value(address(REGS.tasks_start().as_ptr()));
+        let ch_sync = PPI.ch(PPI_SYNC);
+        ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
+        ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
+        chip::self_disabling(PPI_SYNC, PPI_GROUP_SYNC);
+        PPI.chenset().write(|w| {
+            w.set_ch(PPI_ADDRESS, true);
+            w.set_ch(PPI_END, true);
+        });
+        Self { _rtc: rtc, _timer: timer, base: 0, late: 0, lead: CRYSTAL_LEAD_US, paused: Some((rtc_now(), 0)) }
     }
 
     /// Waits until `at` or until `interrupt` completes, with TIMER0 and the
@@ -496,12 +607,34 @@ impl<'peripherals> Clock<'peripherals> {
     /// Use [`Self::sleep_until`] outside timing-critical sections.
     #[inline]
     pub fn wait_until(&self, at: u32) { while !reached(self.now(), at) {} }
+
+    /// Sets up the timer, the RTC and the capture channels, and takes the
+    /// clock sources of the board: the crystal frequency is set here, so
+    /// nothing else may start the crystal before; keep Embassy's
+    /// `hfclk_source` internal. [`calibrate_rc`] waits for it. The clock
+    /// starts paused. Build only one clock: a second one with another
+    /// configuration would change the crystal frequency under the running
+    /// crystal, and `calibrate_rc` keeps the first configuration.
+    #[cfg(feature = "nrf51")]
+    #[inline]
+    #[must_use = "the clock stops being usable once dropped"]
+    pub fn with_config(timer: Peri<'peripherals, TIMER0>, rtc: Peri<'peripherals, RTC0>, config: Config) -> Self {
+        chip::configure_clocks(config.high_frequency, config.low_frequency);
+        Self::setup(timer, rtc)
+    }
 }
 
 /// The address of a register for a PPI endpoint.
 fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 /// Keeps the low frequency RC oscillator within 500 ppm forever.
+///
+/// On the nRF51 it first waits until [`Clock::new`] or [`Clock::with_config`]
+/// took the board's clock sources, so it may be spawned before the clock is
+/// built: it starts the crystal only once its frequency is set, and decides
+/// from the [`Config`] whether to calibrate. With a crystal as the low
+/// frequency clock it then waits forever without calibrating; without a
+/// clock it waits forever.
 ///
 /// Owns TEMP exclusively. The TEMP data-ready interrupt (calling
 /// [`on_temperature_interrupt`]) and the `CLOCK_POWER` interrupt (calling
@@ -514,6 +647,13 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 /// 0.5 °C, or at the latest every second interval.
 #[inline]
 pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>) -> ! {
+    #[cfg(feature = "nrf51")]
+    if !chip::calibrates_rc().await {
+        info!("the low frequency clock is a crystal: no RC calibration");
+        loop {
+            pending::<()>().await;
+        }
+    }
     let mut calibrated_at = None;
     let mut skipped = 0_u8;
     loop {
@@ -540,15 +680,19 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
 /// [`CALIBRATION_TIMEOUT`] if the crystal or the end never comes.
 async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
+    chip::set_calibration_workaround(true);
     let channel = PPI.ch(PPI_CALIBRATE);
     channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
     channel.tep().write_value(address(CLOCK.tasks_cal().as_ptr()));
-    PPI.chenset().write(|w| w.set_ch(PPI_CALIBRATE, true));
+    chip::self_disabling(PPI_CALIBRATE, PPI_GROUP_CALIBRATE);
+    // Enables PPI_CALIBRATE until the crystal's first start event.
+    PPI.tasks_chg(PPI_GROUP_CALIBRATE).en().write_value(1);
     request_crystal();
     let _calibration = Calibration;
     // A crystal that already ran reports no start. If it starts just now
     // as well, the second start of the calibration is harmless.
     if crystal_running() {
+        PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().write_value(1);
         CLOCK.tasks_cal().write_value(1);
     }
     with_timeout(CALIBRATION_TIMEOUT, calibration_done()).await.is_ok()
@@ -607,7 +751,7 @@ async fn temperature() -> i32 {
     poll_fn(|cx| {
         TEMPERATURE_READY.register(cx.waker());
         if TEMP.events_datardy().read() != 0 {
-            return Poll::Ready(TEMP.temp().read().cast_signed());
+            return Poll::Ready(chip::read_temperature());
         }
         TEMP.intenset().write(|w| w.set_datardy(true));
         Poll::Pending
@@ -615,11 +759,11 @@ async fn temperature() -> i32 {
     .await
 }
 
-/// Whether the high frequency clock runs from the crystal.
-fn crystal_running() -> bool {
-    let status = CLOCK.hfclkstat().read();
-    status.state() && status.src() == HfclkstatSrc::Xtal
-}
+/// Whether the high frequency crystal runs: whether it reported its start
+/// since it was last started. HFCLKSTAT may be wrong once the crystal has
+/// started (nRF52832 anomaly 201), so it is not read; the event stays set
+/// until the crystal stops.
+fn crystal_running() -> bool { CLOCK.events_hfclkstarted().read() != 0 }
 
 /// Whether a wrapping difference is a positive time.
 const fn is_ahead(difference: u32) -> bool { difference > 0 && difference < u32::MAX >> 1 }
@@ -636,6 +780,7 @@ fn release_crystal() {
         users.set(left);
         if left == 0 {
             CLOCK.tasks_hfclkstop().write_value(1);
+            CLOCK.events_hfclkstarted().write_value(0);
         }
     });
 }

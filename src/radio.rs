@@ -1,31 +1,31 @@
-//! BLE 1 Mbit radio driver for the nRF52832.
+//! BLE 1 Mbit radio driver.
 
-use crate::sleep;
-use core::{
-    ptr::{read_volatile, with_exposed_provenance_mut, write_volatile},
-    sync::atomic::{Ordering, compiler_fence},
-};
+/// The turnaround timing: the radio's own on the nRF51.
+#[cfg(feature = "nrf51")]
+#[path = "radio/switch_tifs.rs"]
+mod switch;
+/// The turnaround timing: TIMER1 on the nRF52832.
+#[cfg(feature = "nrf52832")]
+#[path = "radio/switch_timer.rs"]
+mod switch;
+
+use crate::{chip, sleep};
+use core::sync::atomic::{Ordering, compiler_fence};
+#[cfg(feature = "nrf52832")]
+use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf::{
     Peri,
     interrupt::{self, InterruptExt as _},
     pac::{
-        PPI,
         RADIO as REGS,
-        TIMER1 as SWITCH,
         radio::{
             regs::Int,
-            vals::{Crcstatus, Endian, Len, Mode, Plen, Ru, S1incl, Skipaddr, State, Txpower},
+            vals::{Crcstatus, Endian, Len, Mode, Skipaddr, State, Txpower},
         },
-        timer::vals::{Bitmode, Mode as TimerMode},
     },
-    peripherals::{RADIO, TIMER1},
+    peripherals::RADIO,
 };
 
-/// Register holding the enable bit for the fixes of anomalies 102, 106 and
-/// 107 (anomaly 182).
-const ANOMALY_182_REGISTER: usize = 0x4000_173C;
-/// Enable bit in [`ANOMALY_182_REGISTER`].
-const ANOMALY_182_BIT: u32 = 1 << 10;
 /// Base address length in bytes.
 const BASE_ADDRESS_LEN: u8 = 3;
 /// BLE CRC polynomial x^24 + x^10 + x^9 + x^6 + x^4 + x^3 + x + 1.
@@ -33,22 +33,15 @@ const CRC_POLY: u32 = 0x0000_065B;
 /// Interframe space in microseconds.
 const IFS_US: u8 = 150;
 /// Length field size in bits.
-const LENGTH_BITS: u8 = 8;
-/// Largest payload the radio accepts.
-const MAX_PAYLOAD: u8 = 255;
-/// Programmable PPI channel: RADIO END to TIMER1 START, which times the
-/// turnaround after a packet.
-const PPI_SWITCH_START: usize = 4;
-/// Programmable PPI channel: TIMER1 COMPARE0 to RADIO TXEN or RXEN.
-const PPI_SWITCH_ENABLE: usize = 5;
-/// Receiver ready time after RXEN with fast ramp-up.
-pub const RX_READY_US: u32 = 40;
+pub(crate) const LENGTH_BITS: u8 = 8;
+/// Receiver ready time after RXEN: 40 us with the fast ramp-up of the
+/// nRF52832, about 140 us on the nRF51.
+pub const RX_READY_US: u32 = chip::RX_READY_US;
 /// Time by which the receiver is ready before the earliest packet start one
 /// interframe space after our packet: the peer may be 2 us early, and the
 /// receiver locks onto the preamble before the access address.
+#[cfg(feature = "nrf52832")]
 const RX_EARLY_US: u32 = 8;
-/// TIMER1 ticks per microsecond, at 16 MHz.
-const SWITCH_TICKS_PER_US: u32 = 16;
 /// Whitening initial value bit that the radio requires to be set.
 const WHITENING_BIT6: u8 = 0x40;
 
@@ -74,13 +67,14 @@ impl Phy {
         }
     }
 
-    /// The PHY of a link layer PHY bit field with exactly one of 1M and 2M.
+    /// The PHY of a link layer PHY bit field with exactly one of 1M and 2M,
+    /// if the radio has it: the nRF51 has LE 1M alone.
     #[inline]
     #[must_use = "the PHY is only decoded"]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         match bits {
             1 => Some(Self::M1),
-            2 => Some(Self::M2),
+            2 if chip::PHY_2M => Some(Self::M2),
             _ => None,
         }
     }
@@ -98,6 +92,7 @@ impl Phy {
     /// TIMER RXEN offset from the END of our packet sent on this PHY, so the
     /// receiver is ready shortly before a packet one interframe space later.
     /// The fast ramp-up and TX chain timings follow Zephyr's Nordic HAL.
+    #[cfg(feature = "nrf52832")]
     #[must_use = "the delay is only computed"]
     #[inline]
     pub const fn listen_offset_us(self) -> u32 {
@@ -111,6 +106,7 @@ impl Phy {
 
     /// TIMER TXEN offset from RX END for a 150-us interframe space.
     /// nRF52832 fast-ramp and RX-chain timings match Zephyr's Nordic HAL.
+    #[cfg(feature = "nrf52832")]
     #[must_use = "the delay is only computed"]
     #[inline]
     pub const fn response_offset_us(self, receive: Self) -> u32 {
@@ -131,10 +127,11 @@ impl Phy {
 
 /// What the radio does after a packet.
 ///
-/// A turnaround is timed by TIMER1,
+/// On the nRF52832 a turnaround is timed by TIMER1,
 /// which PPI starts at the packet END, and whose compare enables the radio
 /// one interframe space after the packet, as Zephyr's software switch does:
-/// the radio's own interframe timing works only with the slow ramp-up.
+/// the radio's own interframe timing works only with the slow ramp-up. The
+/// nRF51 has only that ramp-up and uses the radio's own timing.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Turnaround {
@@ -146,13 +143,15 @@ pub enum Turnaround {
     Transmit,
 }
 
-/// The radio, configured for BLE with fast ramp-up.
+/// The radio, configured for BLE, with fast ramp-up on the nRF52832.
 pub struct Radio<'peripherals> {
     /// The radio peripheral, owned for the lifetime of the driver.
     _peripheral: Peri<'peripherals, RADIO>,
     /// The timer of the turnarounds, owned for the lifetime of the driver.
+    #[cfg(feature = "nrf52832")]
     _switch:     Peri<'peripherals, TIMER1>,
     /// PHY the turnarounds are timed for.
+    #[cfg(feature = "nrf52832")]
     phy:         Phy,
 }
 
@@ -169,6 +168,9 @@ impl<'peripherals> Radio<'peripherals> {
     /// Stops sending or receiving and waits until the radio is disabled.
     #[inline]
     pub fn disable(&mut self) {
+        // The turnaround goes first: on the nRF51 the disabled event that
+        // follows would otherwise enable the radio again through the
+        // shortcut, and send.
         self.set_turnaround(Turnaround::None);
         if REGS.state().read().state() != State::Disabled {
             REGS.events_disabled().write_value(0);
@@ -194,42 +196,30 @@ impl<'peripherals> Radio<'peripherals> {
     #[must_use = "the event is only read"]
     pub fn is_end(&self) -> bool { REGS.events_end().read() != 0 }
 
-    /// Powers the radio and configures it for BLE 1 Mbit with the default
-    /// ramp-up, which the hardware interframe spacing requires. The high
-    /// frequency crystal must be running.
+    /// Powers the radio and configures it for BLE 1 Mbit: on the nRF52832
+    /// with the fast ramp-up and TIMER1 timing the turnarounds, on the nRF51
+    /// with the radio's own interframe timing and the radio trim values of
+    /// FICR. The high frequency crystal must be running.
     #[inline]
     #[must_use = "the radio is unusable once dropped"]
-    pub fn new(radio: Peri<'peripherals, RADIO>, switch: Peri<'peripherals, TIMER1>) -> Self {
+    pub fn new(
+        radio: Peri<'peripherals, RADIO>,
+        #[cfg(feature = "nrf52832")] switch: Peri<'peripherals, TIMER1>,
+    ) -> Self {
         sleep::enable();
         REGS.power().write(|w| w.set_power(true));
-        let register = with_exposed_provenance_mut::<u32>(ANOMALY_182_REGISTER);
-        // SAFETY: the anomaly 182 register is a word-aligned RADIO register.
-        let value = unsafe { read_volatile(register) };
-        // SAFETY: Nordic documents this write for the anomaly 182 fix.
-        let () = unsafe { write_volatile(register, value | ANOMALY_182_BIT) };
+        chip::radio_trim();
         REGS.mode().write(|w| w.set_mode(Mode::Ble1mbit));
-        REGS.modecnf0().write(|w| w.set_ru(Ru::Fast));
+        chip::fast_ramp_up();
         REGS.tifs().write(|w| w.set_tifs(IFS_US));
-        SWITCH.tasks_stop().write_value(1);
-        SWITCH.mode().write(|w| w.set_mode(TimerMode::Timer));
-        SWITCH.bitmode().write(|w| w.set_bitmode(Bitmode::_16bit));
-        SWITCH.prescaler().write(|w| w.set_prescaler(0));
-        SWITCH.shorts().write(|w| {
-            w.set_compare_clear(0, true);
-            w.set_compare_stop(0, true);
-        });
-        SWITCH.tasks_clear().write_value(1);
-        let start = PPI.ch(PPI_SWITCH_START);
-        start.eep().write_value(address(REGS.events_end().as_ptr()));
-        start.tep().write_value(address(SWITCH.tasks_start().as_ptr()));
-        PPI.ch(PPI_SWITCH_ENABLE).eep().write_value(address(SWITCH.events_compare(0).as_ptr()));
+        switch::init();
         REGS.pcnf0().write(|w| {
             w.set_lflen(LENGTH_BITS);
             w.set_s0len(true);
             w.set_s1len(0);
         });
         REGS.pcnf1().write(|w| {
-            w.set_maxlen(MAX_PAYLOAD);
+            w.set_maxlen(chip::ADV_MAXLEN);
             w.set_statlen(0);
             w.set_balen(BASE_ADDRESS_LEN);
             w.set_endian(Endian::Little);
@@ -243,7 +233,13 @@ impl<'peripherals> Radio<'peripherals> {
         REGS.txaddress().write(|w| w.set_txaddress(0));
         REGS.rxaddresses().write(|w| w.set_addr0(true));
         REGS.txpower().write(|w| w.set_txpower(Txpower::_0dBm));
-        Self { _peripheral: radio, _switch: switch, phy: Phy::M1 }
+        Self {
+            _peripheral: radio,
+            #[cfg(feature = "nrf52832")]
+            _switch: switch,
+            #[cfg(feature = "nrf52832")]
+            phy: Phy::M1,
+        }
     }
 
     /// Clears the events and arms the radio for a reception started by a
@@ -327,79 +323,38 @@ impl<'peripherals> Radio<'peripherals> {
     #[inline]
     pub fn set_crc_init(&mut self, init: u32) { REGS.crcinit().write(|w| w.set_crcinit(init)); }
 
+    /// Sets the PHY of the following packets: LE 1M, the only one on the
+    /// nRF51. The radio must be disabled.
+    #[cfg(feature = "nrf51")]
+    #[inline]
+    pub fn set_phy(&mut self, phy: Phy) { chip::set_phy(phy); }
+
     /// Sets the PHY of the following packets. The radio must be disabled.
+    #[cfg(feature = "nrf52832")]
     #[inline]
     pub fn set_phy(&mut self, phy: Phy) {
         self.phy = phy;
-        REGS.mode().write(|w| {
-            w.set_mode(match phy {
-                Phy::M1 => Mode::Ble1mbit,
-                Phy::M2 => Mode::Ble2mbit,
-            });
-        });
-        REGS.pcnf0().modify(|w| {
-            w.set_plen(match phy {
-                Phy::M1 => Plen::_8bit,
-                Phy::M2 => Plen::_16bit,
-            });
-        });
+        chip::set_phy(phy);
     }
 
-    /// Sets whether packets in RAM carry the S1 byte, which the CCM needs on
-    /// data channels.
+    /// Sets the packet layout of the data channels, whose header in RAM
+    /// carries the S1 byte the CCM needs, or of the advertising channels.
     #[inline]
-    pub fn set_s1_included(&mut self, included: bool) {
-        // Data PDUs carry up to 251 payload octets and the four-byte MIC
-        // with the data length extension, as advertising PDUs fit 255 too:
-        // the radio receives and sends whole packets of either.
-        REGS.pcnf1().modify(|w| w.set_maxlen(MAX_PAYLOAD));
-        REGS.pcnf0().modify(|w| {
-            w.set_lflen(LENGTH_BITS);
-            w.set_s0len(true);
-            w.set_s1len(0);
-            w.set_s1incl(if included { S1incl::Include } else { S1incl::Automatic });
-        });
-    }
+    pub fn set_s1_included(&mut self, included: bool) { chip::set_packet_layout(included); }
 
     /// Sets what the radio does after the current packet.
     #[inline]
     pub fn set_turnaround(&mut self, turnaround: Turnaround) {
-        REGS.shorts().write(|w| {
-            w.set_ready_start(true);
-            w.set_end_disable(true);
-            w.set_address_rssistart(true);
-            w.set_disabled_rssistop(true);
-        });
-        PPI.chenclr().write(|w| {
-            w.set_ch(PPI_SWITCH_START, true);
-            w.set_ch(PPI_SWITCH_ENABLE, true);
-        });
-        SWITCH.tasks_stop().write_value(1);
-        // STOP alone keeps the timer's clock requested (nRF52832 anomaly
-        // 78), as Zephyr notes for its software switch timer.
-        SWITCH.tasks_shutdown().write_value(1);
-        SWITCH.tasks_clear().write_value(1);
-        SWITCH.events_compare(0).write_value(0);
-        let (task, offset) = match turnaround {
-            Turnaround::None => return,
-            Turnaround::Receive => (REGS.tasks_rxen().as_ptr(), self.phy.listen_offset_us()),
-            Turnaround::Transmit => (REGS.tasks_txen().as_ptr(), self.phy.response_offset_us(self.phy)),
-        };
-        SWITCH.cc(0).write_value(offset.saturating_mul(SWITCH_TICKS_PER_US));
-        PPI.ch(PPI_SWITCH_ENABLE).tep().write_value(address(task));
-        compiler_fence(Ordering::SeqCst);
-        PPI.chenset().write(|w| {
-            w.set_ch(PPI_SWITCH_START, true);
-            w.set_ch(PPI_SWITCH_ENABLE, true);
-        });
+        #[cfg(feature = "nrf51")]
+        switch::arm(turnaround);
+        #[cfg(feature = "nrf52832")]
+        switch::arm(self, turnaround);
     }
 
     /// Sets the transmit power of the following packets in dBm, one of the
     /// levels the radio supports.
     #[inline]
-    pub fn set_tx_power(&mut self, dbm: i8) {
-        REGS.txpower().write(|w| w.set_txpower(Txpower::from_bits(dbm.cast_unsigned())));
-    }
+    pub fn set_tx_power(&mut self, dbm: i8) { REGS.txpower().write(|w| w.set_txpower(chip::txpower(dbm))); }
 
     /// Sleeps until `ready` holds, woken by the radio events in `events`.
     fn sleep_on<Ready>(events: impl Fn(&mut Int), ready: Ready)
@@ -449,18 +404,8 @@ impl<'peripherals> Radio<'peripherals> {
     /// radio again, and clears the disabled event of that packet. Set the
     /// next turnaround only after this, or it replaces the pending one.
     #[inline]
-    pub fn wait_switched(&mut self) {
-        SWITCH.intenset().write(|w| w.set_compare(0, true));
-        sleep::until(|| SWITCH.events_compare(0).read() != 0);
-        SWITCH.intenclr().write(|w| w.set_compare(0, true));
-        SWITCH.events_compare(0).write_value(0);
-        REGS.events_disabled().write_value(0);
-        compiler_fence(Ordering::SeqCst);
-    }
+    pub fn wait_switched(&mut self) { switch::wait(); }
 }
-
-/// The address of a register for a PPI endpoint.
-fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_or_default() }
 
 /// Radio frequency offset from 2400 MHz of a BLE channel index.
 const fn frequency(channel: u8) -> u8 {
@@ -473,7 +418,7 @@ const fn frequency(channel: u8) -> u8 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "nrf52832"))]
 mod tests {
     use super::Phy;
     #[test]

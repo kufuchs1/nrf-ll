@@ -2,7 +2,11 @@
 
 use super::*;
 
-fn connection() -> Connection {
+/// A new connection. It is built in a critical section, which a test that
+/// changes the sleep clock all tests share holds meanwhile.
+fn connection() -> Connection { critical_section::with(|_| new_connection()) }
+
+fn new_connection() -> Connection {
     Connection::new(
         &ConnectInd {
             access_address:   0x9A32_8370,
@@ -355,6 +359,22 @@ fn window_widening_stops_at_half_the_interval_less_the_interframe_space() {
     assert_eq!(link.widening(60_000_000), 7350);
 }
 
+#[cfg(feature = "nrf51")]
+#[test]
+fn a_low_frequency_crystal_sets_the_sleep_clock_accuracy_of_the_link() {
+    use crate::clock::LowFrequency;
+    let (crystal, rc) = critical_section::with(|_| {
+        chip::set_sleep_clock(LowFrequency::Crystal { ppm: 20 });
+        let crystal = new_connection();
+        chip::set_sleep_clock(LowFrequency::Rc);
+        (crystal, new_connection())
+    });
+    assert_eq!(crystal.sca_ppm, 520);
+    assert_eq!(crystal.widening(1_000_000), 536);
+    assert_eq!(rc.sca_ppm, 1000);
+    assert_eq!(rc.widening(1_000_000), 1016);
+}
+
 #[test]
 fn central_controls_other_than_finishing_are_refused_while_encryption_starts() {
     for phase in [Phase::Starting, Phase::AwaitingStartResponse] {
@@ -388,6 +408,24 @@ fn a_pdu_loaded_in_plain_is_never_sealed_with_an_unassigned_counter() {
     link.load_next(&Shared::new());
     assert!(link.encryption.tx_sealed);
     assert_eq!(link.encryption.tx_counter, 1);
+}
+
+#[test]
+fn every_packet_to_send_keeps_the_s1_byte_zero() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let mut link = connection();
+    link.tx[2] = 0xFF;
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Continuation.bits(), 0, 0]);
+    link.tx[2] = 0xFF;
+    link.enqueue(Llid::Control, &[OP_PING_RSP]);
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Control.bits(), 1, 0]);
+    link.tx[2] = 0xFF;
+    assert!(shared.queue_acl_for_test(&[7; 27]));
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Start.bits(), 27, 0]);
 }
 
 /// A connection with encryption on both ways.
@@ -438,6 +476,7 @@ fn while_paused_only_a_new_encryption_request_or_termination_is_accepted() {
     assert_eq!(link.abort, Some(ERROR_PDU_NOT_ALLOWED));
 }
 
+#[cfg(feature = "nrf52832")]
 #[test]
 fn a_symmetric_phy_update_takes_effect_at_its_instant() {
     let mut link = encrypted();
@@ -461,11 +500,52 @@ fn phy_updates_without_a_change_asymmetric_or_coded_are_handled() {
         link.handle_control(&[OP_PHY_UPDATE_IND, to_peripheral, to_central, 10, 0], true);
         assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
     }
+    let phy = if chip::PHY_2M { 2 } else { 1 };
     let mut link = encrypted();
-    link.handle_control(&[OP_PHY_UPDATE_IND, 2, 2, 0, 0], true);
+    link.handle_control(&[OP_PHY_UPDATE_IND, phy, phy, 0, 0], true);
     assert_eq!(link.abort, Some(ERROR_INSTANT_PASSED));
 }
 
+#[cfg(feature = "nrf51")]
+#[test]
+fn without_2m_a_phy_update_to_it_ends_the_link() {
+    let mut link = encrypted();
+    link.handle_control(&[OP_PHY_UPDATE_IND, 2, 2, 10, 0], true);
+    assert_eq!(link.abort, Some(ERROR_UNSUPPORTED_VALUE));
+    assert!(link.phy_update.is_none());
+}
+
+#[cfg(feature = "nrf51")]
+#[test]
+fn without_2m_the_peripheral_never_asks_for_a_phy_and_refuses_the_central_request() {
+    assert_eq!(FEATURES[1] & 0x01, 0);
+    let shared = Shared::new();
+    let mut link = encrypted();
+    link.central_features = Some([0x1F, 1, 0, 0, 0, 0, 0, 0]);
+    link.start_procedures(0, &shared);
+    assert!(link.queue.iter().all(Option::is_none));
+    assert!(link.phy_request == Request::NotStarted);
+    link.handle_control(&[OP_PHY_REQ, 3, 3], true);
+    assert_eq!(link.queue[0].map(|queued| queued.data[..2] == [OP_UNKNOWN_RSP, OP_PHY_REQ]), Some(true));
+    assert!(link.phy_request == Request::NotStarted);
+}
+
+#[cfg(feature = "nrf51")]
+#[test]
+fn without_2m_a_host_phy_request_completes_at_once_on_le_1m() {
+    let shared = Shared::with_all_events();
+    let mut link = connection();
+    link.host_phy = Some([1, 2]);
+    link.preferred_phys = [1, 2];
+    link.start_procedures(0, &shared);
+    assert!(link.queue.iter().all(Option::is_none));
+    assert_eq!(link.phy_status, Some(STATUS_SUCCESS));
+    link.service_queries(1, &shared);
+    assert!(link.host_phy.is_none());
+    assert_eq!(shared.take_event_code(), Some((0x3E, 0x0C)));
+}
+
+#[cfg(feature = "nrf52832")]
 #[test]
 fn the_peripheral_asks_for_2m_once_encrypted_and_answers_a_central_request() {
     let shared = Shared::new();
@@ -526,10 +606,14 @@ fn the_host_asks_for_parameters_only_after_features_and_phy_and_learns_a_refusal
     link.handle_control(&[OP_FEATURE_RSP, 0x1F, 1, 0, 0, 0, 0, 0, 0], true);
     assert_eq!(link.central_features, Some([0x1F, 1, 0, 0, 0, 0, 0, 0]));
     link.start_procedures(0, &shared);
-    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PHY_REQ));
-    link.queue = [None; QUEUE_LEN];
-    link.handle_control(&[OP_REJECT_EXT_IND, OP_PHY_REQ, 0x1A], true);
-    assert!(link.phy_request == Request::Done);
+    if chip::PHY_2M {
+        assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PHY_REQ));
+        link.queue = [None; QUEUE_LEN];
+        link.handle_control(&[OP_REJECT_EXT_IND, OP_PHY_REQ, 0x1A], true);
+        assert!(link.phy_request == Request::Done);
+    } else {
+        assert!(link.queue[0].is_none());
+    }
     link.param_request = Some(1000);
     link.handle_control(&[OP_REJECT_EXT_IND, OP_CONNECTION_PARAM_REQ, 0x23], true);
     assert_eq!(link.param_status, Some(0x23));
@@ -592,8 +676,11 @@ fn power_changes_are_announced_only_to_a_central_that_supports_them() {
     link.central_features = Some([0x1F, 0, 0, 0, 0x06, 0, 0, 0]);
     link.power_reporting = 1;
     link.start_procedures(0, &shared);
+    // One level up from 0 dBm: +3 dBm, or +4 dBm, the maximum, on the nRF51.
+    let raised = LEVELS_DBM[DEFAULT_LEVEL + 1].cast_unsigned();
+    let flags = if DEFAULT_LEVEL + 2 == LEVELS_DBM.len() { 0x02 } else { 0 };
     let indication = link.queue[0].unwrap();
-    assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 1, 0, 3, 3]);
+    assert_eq!(indication.data[..5], [OP_POWER_CHANGE_IND, 1, flags, raised, raised]);
 }
 
 #[test]
@@ -789,6 +876,7 @@ fn plain_duplicate_can_acknowledge_tx_without_delivering_rx_twice() {
     assert_eq!(link.completed, 1);
 }
 
+#[cfg(feature = "nrf52832")]
 #[test]
 fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
     for (receive, transmit) in [(1, 2), (2, 1)] {
@@ -805,6 +893,7 @@ fn asymmetric_phy_update_keeps_both_directions_and_unchanged_fields() {
     }
 }
 
+#[cfg(feature = "nrf52832")]
 #[test]
 fn host_notifications_survive_queue_pressure() {
     let full = Shared::with_all_events();
@@ -830,6 +919,18 @@ fn host_notifications_survive_queue_pressure() {
     assert!(!available.try_push_event(Packet::completed_packets(1)));
 }
 
+#[cfg(feature = "nrf51")]
+#[test]
+fn power_requests_for_2m_are_refused_and_round_up_without_3_dbm() {
+    let mut link = connection();
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 2, 0, 0], false);
+    assert_eq!(link.queue[0].unwrap().data[..3], [OP_REJECT_EXT_IND, OP_POWER_CONTROL_REQ, ERROR_UNSUPPORTED_VALUE]);
+    link.queue = [None; QUEUE_LEN];
+    link.handle_control(&[OP_POWER_CONTROL_REQ, 1, 3, 0], false);
+    assert_eq!(tx_power(link.power[0].level()), 4);
+}
+
+#[cfg(feature = "nrf52832")]
 #[test]
 fn power_requests_validate_phy_round_up_and_keep_independent_levels() {
     for phy in [0, 3, 4, 8, 255] {
@@ -875,6 +976,7 @@ fn host_remote_queries_work_without_encryption_and_version_is_sent_once() {
     assert!(!shared.try_push_event(Packet::completed_packets(1)));
 }
 
+#[cfg(feature = "nrf52832")]
 #[test]
 fn host_phy_request_completes_even_when_the_central_keeps_the_current_phy() {
     let shared = Shared::with_all_events();
@@ -1063,7 +1165,7 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     }
     link.phy = Phy::M1;
     // Interval, widening, address, ramp-up, margin and processing time.
-    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 40 - 30 - 500);
+    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - RAMP_UP_US - 30 - 500);
 }
 
 #[test]
@@ -1268,7 +1370,7 @@ fn a_central_rejecting_our_parameter_response_ends_its_procedure() {
     link.queue = [None; QUEUE_LEN];
     link.start_procedures(PROCEDURE_TIMEOUT_US, &shared);
     assert_eq!(link.abort, None);
-    assert_eq!(link.queue[0].map(|queued| queued.data[0]), Some(OP_PHY_REQ));
+    assert_eq!(link.queue[0].map(|queued| queued.data[0]), chip::PHY_2M.then_some(OP_PHY_REQ));
 }
 
 #[test]

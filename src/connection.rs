@@ -9,6 +9,7 @@ mod procedures;
 
 use crate::{
     channel::{Hopping, UsedChannels},
+    chip,
     clock::{Clock, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
     hci::{ACL_MAX, AclOut, ConnectionParams, LENGTH_DEFAULT, LENGTH_MAX, Packet, Shared},
@@ -61,10 +62,18 @@ const PROCEDURE_TIMEOUT_US: u32 = 40_000_000;
 ///
 /// LE encryption, the connection parameters request procedure, the extended
 /// reject indication, the peripheral-initiated feature exchange and LE ping
-/// (bits 0 to 4), the LE 2M PHY (bit 8), channel selection algorithm 2 (bit
-/// 14) and LE power control (bits 33 and 34).
-pub const FEATURES: [u8; 8] =
-    [0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 }, 0x41, 0, 0, 0x06, 0, 0, 0];
+/// (bits 0 to 4), the LE 2M PHY (bit 8) where the radio has it, channel
+/// selection algorithm 2 (bit 14) and LE power control (bits 33 and 34).
+pub const FEATURES: [u8; 8] = [
+    0x1F | if cfg!(feature = "data-length") { FEATURE_DATA_LENGTH } else { 0 },
+    if chip::PHY_2M { 0x41 } else { 0x40 },
+    0,
+    0,
+    0x06,
+    0,
+    0,
+    0,
+];
 /// Feature bit in the first octet: LE data packet length extension.
 const FEATURE_DATA_LENGTH: u8 = 0x20;
 /// Longest time on the air of a data PDU the specification allows.
@@ -127,14 +136,13 @@ const OP_PHY_REQ: u8 = 0x16;
 const OP_PHY_RSP: u8 = 0x17;
 /// PHY change at an instant.
 const OP_PHY_UPDATE_IND: u8 = 0x18;
-/// PHYs this side prefers for both directions: LE 2M.
-const PREFERRED_PHYS: u8 = 0x02;
+/// PHYs this side prefers for both directions: LE 2M where the radio has
+/// it.
+const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
 /// Interval of the connection statistics log.
 const REPORT_INTERVAL_US: u32 = 10_000_000;
 /// Header bit: more data follows.
 const MD: u8 = 0x10;
-/// Our sleep clock accuracy in ppm: the calibrated RC oscillator.
-const OWN_SCA_PPM: u32 = 500;
 /// Queued PDUs.
 const QUEUE_LEN: usize = 4;
 /// Radio ramp-up time.
@@ -870,7 +878,8 @@ impl Connection {
         (enable, deadline): (u32, u32),
         shared: &Shared,
     ) -> Option<u32> {
-        let asymmetric = self.phy != self.tx_phy;
+        // Only LE 2M makes the PHYs differ.
+        let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
         let () =
@@ -903,12 +912,15 @@ impl Connection {
             if asymmetric {
                 // The other PHY is set while the radio is disabled, and the
                 // answer started from TIMER0 in its place.
-                radio.wait_disabled();
-                radio.set_phy(self.tx_phy);
-                if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
-                    crypto::disarm();
-                    self.abort = Some(ERROR_HARDWARE_FAILURE);
-                    return None;
+                #[cfg(feature = "nrf52832")]
+                {
+                    radio.wait_disabled();
+                    radio.set_phy(self.tx_phy);
+                    if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
+                        crypto::disarm();
+                        self.abort = Some(ERROR_HARDWARE_FAILURE);
+                        return None;
+                    }
                 }
             } else {
                 // The switch started the answer; the next turnaround follows
@@ -1259,6 +1271,8 @@ impl Connection {
             (TxKind::Empty, Llid::Continuation, 0)
         };
         if let Some(header) = self.tx.first_chunk_mut::<DATA_HEADER_LEN>() {
+            // The S1 byte stays zero: on the nRF51 its bits are sent as the
+            // top bits of the length.
             *header = [llid.bits(), len, 0];
         }
         if self.encryption.tx_on && len != 0 {
@@ -1344,7 +1358,7 @@ impl Connection {
             merged_outcome: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
-            sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
+            sca_ppm: request.sca_ppm.saturating_add(chip::sleep_clock_ppm()),
             skipped: 0,
             sn: false,
             stats: Stats::default(),
@@ -1578,6 +1592,14 @@ impl Connection {
     /// next exchange fits before the next event. A CRC error, a control PDU,
     /// a packet without room, or a running encryption or termination
     /// procedure closes it.
+    ///
+    /// TODO(nRF51 timing): the radio reads the answer about 150 us after the
+    /// END of the received packet, which on the 16 MHz Cortex-M0 is about
+    /// 2,200 cycles for all of this, with the CCM encryption, against the
+    /// four to five times as many of the nRF52832. Measure the slack on
+    /// hardware; if it is short, seal the answer ahead and patch only the
+    /// header flags here, which the MIC does not cover, and arm the next
+    /// reception while sending.
     fn respond(
         &mut self,
         radio: &mut Radio<'_>,

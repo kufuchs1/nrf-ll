@@ -19,8 +19,27 @@ jobs:
       - name: fmt
         run: cargo fmt --check
       - name: host tests
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          cargo test --locked --features data-length
+          cargo test --locked --no-default-features --features nrf51
       - name: lints
         run: |
           cargo clippy --locked --target thumbv7em-none-eabihf
           cargo clippy --locked --target thumbv7em-none-eabihf --features defmt
+          cargo clippy --locked --target thumbv7em-none-eabihf --features data-length
+          cargo clippy --locked --target thumbv6m-none-eabi --no-default-features --features nrf51
+          cargo clippy --locked --target thumbv6m-none-eabi --no-default-features --features nrf51,defmt
+      - name: chip guards
+        run: |
+          # The nRF51 build refuses the data length extension.
+          refused=$(cargo check --locked --target thumbv6m-none-eabi --no-default-features --features nrf51,data-length 2>&1 || true)
+          case "$refused" in
+            *'the nRF51 CCM encrypts payloads of up to 27 octets'*) ;;
+            *) echo 'the nRF51 build takes data-length' >&2; exit 1 ;;
+          esac
+          # The nRF52832 errata registers are written in its chip file only.
+          if grep -rnE '0x4000_(173C|0C34)' src --include='*.rs' --exclude=nrf52832.rs; then
+            echo 'nRF52832 errata register outside src/chip/nrf52832.rs' >&2
+            exit 1
+          fi

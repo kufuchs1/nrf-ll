@@ -386,6 +386,12 @@ pub fn event(
 }
 
 /// Sends the advertisement on one channel and serves a request that follows.
+///
+/// TODO(nRF51 timing): the scan request checks run within the interframe
+/// space, with up to two address resolutions on the ECB for the filter
+/// accept list, which may not fit on the 16 MHz Cortex-M0. Measure on
+/// hardware; a late decision sends the scan request back instead of the scan
+/// response.
 fn on_channel(
     radio: &mut Radio<'_>,
     clock: &Clock<'_>,

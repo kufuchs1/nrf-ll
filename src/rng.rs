@@ -114,7 +114,7 @@ impl<Peripheral: Backend> Generator<Peripheral> {
     }
 }
 
-/// nRF52832 entropy register backend.
+/// Entropy register backend of the nRF52832 and the nRF51.
 struct Hardware;
 
 impl Backend for Hardware {

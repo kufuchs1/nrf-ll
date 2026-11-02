@@ -1293,6 +1293,10 @@ impl<'shared> Hci<'shared> {
             });
         }
         if opcode == 0x2032 {
+            #[cfg(feature = "nrf51")]
+            if params.len() == 7 && params.get(2..5).is_some_and(names_missing_phy) {
+                return STATUS_UNSUPPORTED;
+            }
             if params.len() != 7
                 || params.get(2..5).and_then(phy_preferences).is_none()
                 || params
@@ -1371,6 +1375,10 @@ impl<'shared> Hci<'shared> {
             0x2027..=0x2029 => (self.resolving_command(opcode, params), 0),
             0x0C03 => (STATUS_INVALID_PARAMETERS, 0),
             0x2031 => {
+                #[cfg(feature = "nrf51")]
+                if names_missing_phy(params) {
+                    return (STATUS_UNSUPPORTED, 0);
+                }
                 let Some(preferences) = phy_preferences(params) else { return (STATUS_INVALID_PARAMETERS, 0) };
                 self.shared.state.lock(|cell| cell.borrow_mut().preferred_phys = preferences);
                 (STATUS_SUCCESS, 0)
@@ -1923,6 +1931,17 @@ impl Transport for Hci<'_> {
     }
 }
 
+/// Whether the common `All_PHYs`, `TX_PHYs` and `RX_PHYs` fields prefer a
+/// PHY the nRF51 lacks, LE 2M or LE Coded, for a direction the host has a
+/// preference for. Fields with reserved bits are left to
+/// [`phy_preferences`] to refuse.
+#[cfg(feature = "nrf51")]
+fn names_missing_phy(params: &[u8]) -> bool {
+    let &[all, tx, rx] = params else { return false };
+    let missing = |no_preference: u8, phys: u8| all & no_preference == 0 && phys & 0b110 != 0;
+    all <= 3 && tx <= 7 && rx <= 7 && (missing(1, tx) || missing(2, rx))
+}
+
 /// Validates the common `All_PHYs`, `TX_PHYs` and `RX_PHYs` fields.
 fn phy_preferences(params: &[u8]) -> Option<[u8; 2]> {
     let &[all, tx, rx] = params else { return None };
@@ -2051,6 +2070,7 @@ mod tests {
         assert_ne!(packet.bytes[6 + 5] & 0x80, 0);
     }
 
+    #[cfg(feature = "nrf52832")]
     #[test]
     fn host_phy_command_validates_and_publishes_only_after_status() {
         let shared = Shared::new();
@@ -2065,6 +2085,43 @@ mod tests {
         assert_eq!(hci.command_async(0x2032, &[0, 0, 0, 4, 2, 0, 0]), STATUS_INVALID_PARAMETERS);
         let mut returned = [0; 8];
         assert_eq!(hci.command_sync(0x2031, &[3, 0, 0], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.preferred_phys(), [3, 3]);
+    }
+
+    #[cfg(feature = "nrf51")]
+    #[test]
+    fn without_2m_host_phy_commands_naming_2m_or_coded_are_unsupported() {
+        let shared = Shared::new();
+        shared.set_connected(true);
+        let hci = Hci::new(&shared);
+        let mut returned = [0; 8];
+        let preferred = shared.preferred_phys();
+        for [tx, rx] in [[2, 1], [1, 2], [3, 1], [1, 3], [4, 1], [1, 4], [5, 5], [6, 6]] {
+            assert_eq!(hci.command_async(0x2032, &[0, 0, 0, tx, rx, 0, 0]), STATUS_UNSUPPORTED);
+            assert_eq!(hci.command_sync(0x2031, &[0, tx, rx], &mut returned).0, STATUS_UNSUPPORTED);
+        }
+        assert_eq!(hci.command_sync(0x2031, &[1, 1, 2], &mut returned).0, STATUS_UNSUPPORTED);
+        assert_eq!(hci.command_sync(0x2031, &[2, 2, 1], &mut returned).0, STATUS_UNSUPPORTED);
+        assert_eq!(shared.preferred_phys(), preferred);
+        // Reserved bits stay invalid parameters.
+        assert_eq!(hci.command_async(0x2032, &[0, 0, 0, 8, 1, 0, 0]), STATUS_INVALID_PARAMETERS);
+        assert_eq!(hci.command_sync(0x2031, &[4, 1, 1], &mut returned).0, STATUS_INVALID_PARAMETERS);
+        // The status of a refused request publishes nothing.
+        assert!(run(hci.command(&[0x32, 0x20, 7, 0, 0, 0, 2, 2, 0, 0])).is_ok());
+        let status = shared.events.try_receive().unwrap();
+        assert_eq!(&status.bytes[..6], &[15, 4, STATUS_UNSUPPORTED, 1, 0x32, 0x20]);
+        assert_eq!(shared.take_phy_request(), None);
+        // LE 1M alone, or no preference, is taken.
+        assert!(run(hci.command(&[0x32, 0x20, 7, 0, 0, 0, 1, 1, 0, 0])).is_ok());
+        let status = shared.events.try_receive().unwrap();
+        assert_eq!(&status.bytes[..6], &[15, 4, 0, 1, 0x32, 0x20]);
+        assert_eq!(shared.take_phy_request(), Some([1, 1]));
+        assert_eq!(hci.command_sync(0x2031, &[0, 1, 1], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.preferred_phys(), [1, 1]);
+        // A direction without a preference ignores its PHYs.
+        assert_eq!(hci.command_sync(0x2031, &[1, 2, 1], &mut returned).0, STATUS_SUCCESS);
+        assert_eq!(shared.preferred_phys(), [3, 1]);
+        assert_eq!(hci.command_sync(0x2031, &[3, 2, 4], &mut returned).0, STATUS_SUCCESS);
         assert_eq!(shared.preferred_phys(), [3, 3]);
     }
 

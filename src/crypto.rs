@@ -7,7 +7,7 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::{radio::Phy, sleep};
+use crate::{chip, radio::Phy, sleep};
 use core::{
     hint::black_box,
     sync::atomic::{Ordering, compiler_fence},
@@ -16,7 +16,7 @@ use embassy_nrf::pac::{
     CCM,
     ECB,
     PPI,
-    ccm::vals::{Datarate, Enable, Length, Micstatus, Mode},
+    ccm::vals::{Enable, Micstatus, Mode},
 };
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 
@@ -28,13 +28,10 @@ const COUNTER_OFFSET: usize = 16;
 const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
 const IV_OFFSET: usize = 25;
-/// Busy-wait iterations for a decryption to finish after the packet end.
-const DECRYPT_WAIT: u32 = 2000;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 const PPI_CRYPT: usize = 25;
-/// Scratch space for every value of an untrusted eight-bit length field.
-/// RADIO MAXLEN bounds radio DMA but does not rewrite that field for CCM.
-pub const SCRATCH_LEN: usize = 16 + 255;
+/// Scratch space for every length the CCM may take from a packet.
+pub const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 /// The packet counter is 39 bits; the next bit belongs to the direction.
 pub const COUNTER_LIMIT: u64 = 1 << 39;
 
@@ -55,18 +52,14 @@ pub unsafe fn arm_decrypt(
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
 ) {
-    CCM.mode().write(|w| {
-        w.set_mode(Mode::Decryption);
-        w.set_datarate(datarate(phy));
-        w.set_length(Length::Extended);
-    });
+    chip::ccm_mode(Mode::Decryption, phy);
     set_pointers(config, input.cast_const(), output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
     compiler_fence(Ordering::SeqCst);
-    // The key stream for a payload of up to 251 octets is generated now,
+    // The key stream for the longest payload the CCM takes is generated now,
     // well before the access address starts the decryption, as in Zephyr.
     CCM.tasks_ksgen().write_value(1);
     PPI.chenset().write(|w| w.set_ch(PPI_CRYPT, true));
@@ -89,11 +82,7 @@ pub unsafe fn arm_encrypt(
     phy: Phy,
 ) {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
-    CCM.mode().write(|w| {
-        w.set_mode(Mode::Encryption);
-        w.set_datarate(datarate(phy));
-        w.set_length(Length::Extended);
-    });
+    chip::ccm_mode(Mode::Encryption, phy);
     set_pointers(config, input, output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     CCM.events_endksgen().write_value(0);
@@ -102,14 +91,6 @@ pub unsafe fn arm_encrypt(
     compiler_fence(Ordering::SeqCst);
     // The packet is encrypted at once, ahead of the radio reading it.
     CCM.tasks_ksgen().write_value(1);
-}
-
-/// The CCM data rate matching `phy`, for decryption on the fly.
-const fn datarate(phy: Phy) -> Datarate {
-    match phy {
-        Phy::M1 => Datarate::_1mbit,
-        Phy::M2 => Datarate::_2mbit,
-    }
 }
 
 /// A CCM configuration for one direction.
@@ -258,7 +239,7 @@ pub fn wipe(bytes: &mut [u8]) {
 #[inline]
 #[must_use = "the MIC status is only read"]
 pub fn wait_decrypted() -> Option<bool> {
-    let mut remaining = DECRYPT_WAIT;
+    let mut remaining = chip::DECRYPT_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
     }
@@ -357,8 +338,14 @@ mod tests {
 
     #[test]
     fn ccm_dma_buffers_cover_the_untrusted_length_field() {
-        assert!(SCRATCH_LEN >= 16 + usize::from(u8::MAX));
-        assert!(crate::pdu::BUFFER_LEN >= 3 + usize::from(u8::MAX));
+        // An eight-bit length field on the nRF52832; on the nRF51 a five-bit
+        // one, and a CCM that encrypts at most 27 octets.
+        let (length_max, key_stream_max) =
+            if cfg!(feature = "nrf51") { (31, 27) } else { (usize::from(u8::MAX), usize::from(u8::MAX)) };
+        assert!(SCRATCH_LEN >= 16 + key_stream_max);
+        assert!(crate::pdu::BUFFER_LEN >= 3 + length_max);
+        // Legacy advertising PDUs carry up to 37 octets.
+        assert!(crate::pdu::BUFFER_LEN >= crate::pdu::HEADER_LEN + 37);
     }
 
     #[test]

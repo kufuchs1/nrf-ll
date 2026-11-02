@@ -1,11 +1,28 @@
-//! Bluetooth LE link layer for the nRF52832.
+//! Bluetooth LE link layer for the nRF52832 and the nRF51.
 
 #![no_std]
+
+#[cfg(all(feature = "nrf52832", feature = "nrf51"))]
+compile_error!(
+    "the chip features nrf52832 and nrf51 exclude each other: build for the nRF51 with default-features = false"
+);
+#[cfg(not(any(feature = "nrf52832", feature = "nrf51")))]
+compile_error!("enable a chip feature: nrf52832, the default, or nrf51");
+#[cfg(all(feature = "nrf51", feature = "data-length"))]
+compile_error!("the nRF51 CCM encrypts payloads of up to 27 octets: the data-length feature needs the nRF52832");
 
 /// Connectable advertising.
 pub mod advertiser;
 /// Data channel map and channel selection.
 pub mod channel;
+/// Register code that differs between the chips.
+#[cfg(feature = "nrf51")]
+#[path = "chip/nrf51.rs"]
+mod chip;
+/// Register code that differs between the chips.
+#[cfg(feature = "nrf52832")]
+#[path = "chip/nrf52832.rs"]
+mod chip;
 /// Microsecond time base.
 pub mod clock;
 /// Peripheral connections.
