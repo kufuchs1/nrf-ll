@@ -40,10 +40,16 @@ pub const DECRYPT_WAIT: u32 = 2000;
 pub const LEVELS_DBM: [i8; 8] = [-20, -16, -12, -8, -4, 0, 3, 4];
 /// Largest payload the radio accepts on any channel.
 const MAX_PAYLOAD: u8 = 255;
+/// Largest payload the radio accepts on any channel, for the size of the
+/// packet buffers.
+pub const PAYLOAD_MAX: usize = 255;
 /// Whether the radio has LE 2M.
 pub const PHY_2M: bool = true;
 /// Receiver ready time after RXEN with fast ramp-up.
 pub const RX_READY_US: u32 = 40;
+/// CCM scratch space for every value of an untrusted eight-bit length field:
+/// RADIO MAXLEN bounds radio DMA but does not rewrite that field for the CCM.
+pub const SCRATCH_LEN: usize = 16 + 255;
 
 /// Sets the CCM mode for a packet on `phy`, in the extended length mode.
 #[inline]

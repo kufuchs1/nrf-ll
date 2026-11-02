@@ -1,5 +1,7 @@
 //! Link layer packet formats.
 
+use crate::chip;
+
 /// Length of a device address.
 pub const ADDRESS_LEN: usize = 6;
 /// Access address of the advertising channels.
@@ -8,8 +10,9 @@ pub const ADV_ACCESS_ADDRESS: u32 = 0x8E89_BED6;
 pub const ADV_CRC_INIT: u32 = 0x0055_5555;
 /// Largest advertising channel payload.
 pub const ADV_PAYLOAD_MAX: usize = 255;
-/// Size of a packet buffer: header, S1 byte and the largest payload.
-pub const BUFFER_LEN: usize = HEADER_LEN + 1 + 255;
+/// Size of a packet buffer: header, S1 byte and the largest payload the
+/// radio accepts, 255 octets on the nRF52832 and 37 on the nRF51.
+pub const BUFFER_LEN: usize = HEADER_LEN + 1 + chip::PAYLOAD_MAX;
 /// Length of a PDU header.
 pub const HEADER_LEN: usize = 2;
 /// Header bit marking the receiver address as random.

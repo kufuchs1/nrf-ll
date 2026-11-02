@@ -1271,6 +1271,8 @@ impl Connection {
             (TxKind::Empty, Llid::Continuation, 0)
         };
         if let Some(header) = self.tx.first_chunk_mut::<DATA_HEADER_LEN>() {
+            // The S1 byte stays zero: on the nRF51 its bits are sent as the
+            // top bits of the length.
             *header = [llid.bits(), len, 0];
         }
         if self.encryption.tx_on && len != 0 {

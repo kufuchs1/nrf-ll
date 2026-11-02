@@ -390,6 +390,24 @@ fn a_pdu_loaded_in_plain_is_never_sealed_with_an_unassigned_counter() {
     assert_eq!(link.encryption.tx_counter, 1);
 }
 
+#[test]
+fn every_packet_to_send_keeps_the_s1_byte_zero() {
+    let shared = Shared::new();
+    shared.set_connected(true);
+    let mut link = connection();
+    link.tx[2] = 0xFF;
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Continuation.bits(), 0, 0]);
+    link.tx[2] = 0xFF;
+    link.enqueue(Llid::Control, &[OP_PING_RSP]);
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Control.bits(), 1, 0]);
+    link.tx[2] = 0xFF;
+    assert!(shared.queue_acl_for_test(&[7; 27]));
+    link.load_next(&shared);
+    assert_eq!(link.tx[..3], [Llid::Start.bits(), 27, 0]);
+}
+
 /// A connection with encryption on both ways.
 fn encrypted() -> Connection {
     let mut link = connection();

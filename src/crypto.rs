@@ -30,9 +30,8 @@ const DIRECTION_OFFSET: usize = 24;
 const IV_OFFSET: usize = 25;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 const PPI_CRYPT: usize = 25;
-/// Scratch space for every value of an untrusted eight-bit length field.
-/// RADIO MAXLEN bounds radio DMA but does not rewrite that field for CCM.
-pub const SCRATCH_LEN: usize = 16 + 255;
+/// Scratch space for every length the CCM may take from a packet.
+pub const SCRATCH_LEN: usize = chip::SCRATCH_LEN;
 /// The packet counter is 39 bits; the next bit belongs to the direction.
 pub const COUNTER_LIMIT: u64 = 1 << 39;
 
@@ -60,7 +59,7 @@ pub unsafe fn arm_decrypt(
     CCM.events_endcrypt().write_value(0);
     CCM.events_error().write_value(0);
     compiler_fence(Ordering::SeqCst);
-    // The key stream for a payload of up to 251 octets is generated now,
+    // The key stream for the longest payload the CCM takes is generated now,
     // well before the access address starts the decryption, as in Zephyr.
     CCM.tasks_ksgen().write_value(1);
     PPI.chenset().write(|w| w.set_ch(PPI_CRYPT, true));
@@ -339,8 +338,14 @@ mod tests {
 
     #[test]
     fn ccm_dma_buffers_cover_the_untrusted_length_field() {
-        assert!(SCRATCH_LEN >= 16 + usize::from(u8::MAX));
-        assert!(crate::pdu::BUFFER_LEN >= 3 + usize::from(u8::MAX));
+        // An eight-bit length field on the nRF52832; on the nRF51 a five-bit
+        // one, and a CCM that encrypts at most 27 octets.
+        let (length_max, key_stream_max) =
+            if cfg!(feature = "nrf51") { (31, 27) } else { (usize::from(u8::MAX), usize::from(u8::MAX)) };
+        assert!(SCRATCH_LEN >= 16 + key_stream_max);
+        assert!(crate::pdu::BUFFER_LEN >= 3 + length_max);
+        // Legacy advertising PDUs carry up to 37 octets.
+        assert!(crate::pdu::BUFFER_LEN >= crate::pdu::HEADER_LEN + 37);
     }
 
     #[test]

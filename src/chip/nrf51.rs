@@ -54,6 +54,10 @@ const DATA_S1_BITS: u8 = 3;
 /// Busy-wait iterations for a decryption to finish after the packet end:
 /// about the 250 us of the nRF52832's 2000 on the 16 MHz Cortex-M0.
 pub const DECRYPT_WAIT: u32 = 400;
+/// Largest payload the radio accepts on any channel, for the size of the
+/// packet buffers: an advertising payload, as a data payload with its MIC
+/// takes 31 octets at most.
+pub const PAYLOAD_MAX: usize = 37;
 /// Programmable PPI channels above a channel that its stand-in for FORK
 /// uses: the nRF51 has 16 programmable channels and no FORK.
 const FORK_OFFSET: usize = 8;
@@ -66,6 +70,9 @@ pub const PHY_2M: bool = false;
 /// Zephyr's nRF51 HAL uses 138 us.
 /// TODO(datasheet): confirm it in the nRF51802 product specification.
 pub const RX_READY_US: u32 = 140;
+/// CCM scratch space: 16 octets and the 27-octet payload the nRF51 CCM
+/// handles at most, whatever the length field holds.
+pub const SCRATCH_LEN: usize = 16 + 27;
 /// Accuracy of the low frequency clock in ppm, as configured.
 static SLEEP_CLOCK_PPM: AtomicU32 = AtomicU32::new(RC_PPM);
 /// Whether the low frequency clock is the RC oscillator, as configured.
