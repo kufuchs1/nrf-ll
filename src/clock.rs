@@ -5,11 +5,10 @@
 //! keeps the time on the low frequency clock and restarts TIMER0 at an exact
 //! tick before the next event.
 
-use crate::{log::info, sleep};
+use crate::{chip, log::info, sleep};
 use core::{
     cell::Cell,
     future::{Future, poll_fn},
-    ptr::{with_exposed_provenance_mut, write_volatile},
     task::Poll,
 };
 use embassy_futures::select::{Either, select};
@@ -46,10 +45,6 @@ const CC_START: usize = 0;
 /// Time after which a calibration whose crystal or end never came is given
 /// up until the next interval.
 const CALIBRATION_TIMEOUT: Duration = Duration::from_millis(100);
-/// Register of the workaround for nRF52832 anomaly 192: the RC oscillator's
-/// frequency can be off by more than 500 ppm after a calibration during
-/// which the CPU slept.
-const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
 /// Programmable PPI channel: CLOCK HFCLKSTARTED to CLOCK CAL, while a
 /// calibration waits for the crystal.
 const PPI_CALIBRATE: usize = 3;
@@ -140,10 +135,10 @@ struct Calibration;
 impl Drop for Calibration {
     fn drop(&mut self) {
         PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().write_value(1);
-        PPI.chenclr().write(|w| w.set_ch(PPI_CALIBRATE, true));
+        chip::disable_channel(PPI_CALIBRATE);
         CLOCK.intenclr().write(|w| w.set_done(true));
         CLOCK.events_done().write_value(0);
-        set_anomaly_192(false);
+        chip::set_calibration_workaround(false);
         release_crystal();
     }
 }
@@ -353,8 +348,7 @@ impl<'peripherals> Clock<'peripherals> {
         let ch_sync = PPI.ch(PPI_SYNC);
         ch_sync.eep().write_value(address(RTC.events_compare(RTC_SYNC).as_ptr()));
         ch_sync.tep().write_value(address(REGS.tasks_capture(CC_NOW).as_ptr()));
-        PPI.chg(PPI_GROUP_SYNC).write(|w| w.set_ch(PPI_SYNC, true));
-        PPI.fork(PPI_SYNC).tep().write_value(address(PPI.tasks_chg(PPI_GROUP_SYNC).dis().as_ptr()));
+        chip::self_disabling(PPI_SYNC, PPI_GROUP_SYNC);
         PPI.chenset().write(|w| {
             w.set_ch(PPI_ADDRESS, true);
             w.set_ch(PPI_END, true);
@@ -391,7 +385,7 @@ impl<'peripherals> Clock<'peripherals> {
                 break tick;
             }
         };
-        PPI.chenclr().write(|w| w.set_ch(PPI_SYNC, true));
+        chip::disable_channel(PPI_SYNC);
         let time = self.base.wrapping_add(REGS.cc(CC_NOW).read());
         REGS.tasks_stop().write_value(1);
         // STOP alone keeps drawing current (nRF52832 anomaly 78).
@@ -558,12 +552,11 @@ pub async fn calibrate_rc(_temperature: Peri<'_, embassy_nrf::peripherals::TEMP>
 /// [`CALIBRATION_TIMEOUT`] if the crystal or the end never comes.
 async fn calibrate() -> bool {
     CLOCK.events_done().write_value(0);
-    set_anomaly_192(true);
+    chip::set_calibration_workaround(true);
     let channel = PPI.ch(PPI_CALIBRATE);
     channel.eep().write_value(address(CLOCK.events_hfclkstarted().as_ptr()));
     channel.tep().write_value(address(CLOCK.tasks_cal().as_ptr()));
-    PPI.chg(PPI_GROUP_CALIBRATE).write(|w| w.set_ch(PPI_CALIBRATE, true));
-    PPI.fork(PPI_CALIBRATE).tep().write_value(address(PPI.tasks_chg(PPI_GROUP_CALIBRATE).dis().as_ptr()));
+    chip::self_disabling(PPI_CALIBRATE, PPI_GROUP_CALIBRATE);
     // Enables PPI_CALIBRATE until the crystal's first start event.
     PPI.tasks_chg(PPI_GROUP_CALIBRATE).en().write_value(1);
     request_crystal();
@@ -630,7 +623,7 @@ async fn temperature() -> i32 {
     poll_fn(|cx| {
         TEMPERATURE_READY.register(cx.waker());
         if TEMP.events_datardy().read() != 0 {
-            return Poll::Ready(TEMP.temp().read().cast_signed());
+            return Poll::Ready(chip::read_temperature());
         }
         TEMP.intenset().write(|w| w.set_datardy(true));
         Poll::Pending
@@ -662,14 +655,6 @@ fn release_crystal() {
             CLOCK.events_hfclkstarted().write_value(0);
         }
     });
-}
-
-/// Sets the workaround for nRF52832 anomaly 192 while an RC calibration may
-/// run, and clears it after.
-fn set_anomaly_192(calibrating: bool) {
-    let register = with_exposed_provenance_mut::<u32>(ANOMALY_192_REGISTER);
-    // SAFETY: Nordic documents these writes for the anomaly 192 workaround.
-    let () = unsafe { write_volatile(register, if calibrating { 2 } else { 0 }) };
 }
 
 /// Adds a user of the high frequency crystal and starts it for the first.

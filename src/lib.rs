@@ -6,6 +6,9 @@
 pub mod advertiser;
 /// Data channel map and channel selection.
 pub mod channel;
+/// Register code that differs between the chips.
+#[path = "chip/nrf52832.rs"]
+mod chip;
 /// Microsecond time base.
 pub mod clock;
 /// Peripheral connections.

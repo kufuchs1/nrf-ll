@@ -7,7 +7,7 @@
 //! cannot start one of its own in between, and retries with interrupts on, so
 //! a radio event that aborted it is not delayed.
 
-use crate::{radio::Phy, sleep};
+use crate::{chip, radio::Phy, sleep};
 use core::{
     hint::black_box,
     sync::atomic::{Ordering, compiler_fence},
@@ -16,7 +16,7 @@ use embassy_nrf::pac::{
     CCM,
     ECB,
     PPI,
-    ccm::vals::{Datarate, Enable, Length, Micstatus, Mode},
+    ccm::vals::{Enable, Micstatus, Mode},
 };
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 
@@ -55,11 +55,7 @@ pub unsafe fn arm_decrypt(
     scratch: &mut [u8; SCRATCH_LEN],
     phy: Phy,
 ) {
-    CCM.mode().write(|w| {
-        w.set_mode(Mode::Decryption);
-        w.set_datarate(datarate(phy));
-        w.set_length(Length::Extended);
-    });
+    chip::ccm_mode(Mode::Decryption, phy);
     set_pointers(config, input.cast_const(), output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(false));
     CCM.events_endksgen().write_value(0);
@@ -89,11 +85,7 @@ pub unsafe fn arm_encrypt(
     phy: Phy,
 ) {
     PPI.chenclr().write(|w| w.set_ch(PPI_CRYPT, true));
-    CCM.mode().write(|w| {
-        w.set_mode(Mode::Encryption);
-        w.set_datarate(datarate(phy));
-        w.set_length(Length::Extended);
-    });
+    chip::ccm_mode(Mode::Encryption, phy);
     set_pointers(config, input, output, scratch);
     CCM.shorts().write(|w| w.set_endksgen_crypt(true));
     CCM.events_endksgen().write_value(0);
@@ -102,14 +94,6 @@ pub unsafe fn arm_encrypt(
     compiler_fence(Ordering::SeqCst);
     // The packet is encrypted at once, ahead of the radio reading it.
     CCM.tasks_ksgen().write_value(1);
-}
-
-/// The CCM data rate matching `phy`, for decryption on the fly.
-const fn datarate(phy: Phy) -> Datarate {
-    match phy {
-        Phy::M1 => Datarate::_1mbit,
-        Phy::M2 => Datarate::_2mbit,
-    }
 }
 
 /// A CCM configuration for one direction.
