@@ -27,6 +27,11 @@ pub const LEVELS_DBM: [i8; chip::LEVELS_DBM.len()] = chip::LEVELS_DBM;
 /// Level at the start of a connection and for advertising: 0 dBm.
 pub const DEFAULT_LEVEL: usize = 5;
 /// Estimated signal at the central above which the power steps down.
+///
+/// TODO(nRF51): the nRF51's RSSI is coarser than the nRF52832's, about
+/// ±6 dB against ±2 dB as the nRF51822 specifies it; check the nRF51802
+/// product specification, and measure on hardware whether the 12 dB between
+/// the targets keeps the power from stepping back and forth.
 const TARGET_HIGH_DBM: i32 = -60;
 /// Estimated signal at the central below which the power steps up.
 const TARGET_LOW_DBM: i32 = -72;
