@@ -28,8 +28,6 @@ const COUNTER_OFFSET: usize = 16;
 const DIRECTION_OFFSET: usize = 24;
 /// Offset of the IV in a CCM configuration.
 const IV_OFFSET: usize = 25;
-/// Busy-wait iterations for a decryption to finish after the packet end.
-const DECRYPT_WAIT: u32 = 2000;
 /// Fixed PPI channel: RADIO ADDRESS to CCM CRYPT.
 const PPI_CRYPT: usize = 25;
 /// Scratch space for every value of an untrusted eight-bit length field.
@@ -242,7 +240,7 @@ pub fn wipe(bytes: &mut [u8]) {
 #[inline]
 #[must_use = "the MIC status is only read"]
 pub fn wait_decrypted() -> Option<bool> {
-    let mut remaining = DECRYPT_WAIT;
+    let mut remaining = chip::DECRYPT_WAIT;
     while CCM.events_endcrypt().read() == 0 && CCM.events_error().read() == 0 && remaining != 0 {
         remaining = remaining.saturating_sub(1);
     }

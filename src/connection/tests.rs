@@ -1063,7 +1063,7 @@ fn an_event_continues_only_while_another_exchange_fits_before_the_next() {
     }
     link.phy = Phy::M1;
     // Interval, widening, address, ramp-up, margin and processing time.
-    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - 40 - 30 - 500);
+    assert_eq!(link.close_by(0), 15_000 - 31 - 40 - RAMP_UP_US - 30 - 500);
 }
 
 #[test]

@@ -34,6 +34,9 @@ fn clear() {
     interrupt::RNG.unpend();
     interrupt::RTC0.unpend();
     interrupt::TIMER0.unpend();
+    // TIMER1 times the turnarounds on the nRF52832 only; on the nRF51 the
+    // radio does, and TIMER1 is left to the application.
+    #[cfg(feature = "nrf52832")]
     interrupt::TIMER1.unpend();
 }
 

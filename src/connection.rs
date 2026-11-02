@@ -9,6 +9,7 @@ mod procedures;
 
 use crate::{
     channel::{Hopping, UsedChannels},
+    chip,
     clock::{Clock, reached},
     crypto::{self, CONFIG_LEN, SCRATCH_LEN},
     hci::{ACL_MAX, AclOut, ConnectionParams, LENGTH_DEFAULT, LENGTH_MAX, Packet, Shared},
@@ -870,7 +871,8 @@ impl Connection {
         (enable, deadline): (u32, u32),
         shared: &Shared,
     ) -> Option<u32> {
-        let asymmetric = self.phy != self.tx_phy;
+        // Only LE 2M makes the PHYs differ.
+        let asymmetric = chip::PHY_2M && self.phy != self.tx_phy;
         // SAFETY: `rx` is a full packet buffer borrowed for this whole
         // exchange, which disables the radio on every path out.
         let () =
@@ -903,12 +905,15 @@ impl Connection {
             if asymmetric {
                 // The other PHY is set while the radio is disabled, and the
                 // answer started from TIMER0 in its place.
-                radio.wait_disabled();
-                radio.set_phy(self.tx_phy);
-                if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
-                    crypto::disarm();
-                    self.abort = Some(ERROR_HARDWARE_FAILURE);
-                    return None;
+                #[cfg(feature = "nrf52832")]
+                {
+                    radio.wait_disabled();
+                    radio.set_phy(self.tx_phy);
+                    if !clock.transmit_at(clock.end_time().wrapping_add(self.tx_phy.response_offset_us(self.phy))) {
+                        crypto::disarm();
+                        self.abort = Some(ERROR_HARDWARE_FAILURE);
+                        return None;
+                    }
                 }
             } else {
                 // The switch started the answer; the next turnaround follows
@@ -1578,6 +1583,14 @@ impl Connection {
     /// next exchange fits before the next event. A CRC error, a control PDU,
     /// a packet without room, or a running encryption or termination
     /// procedure closes it.
+    ///
+    /// TODO(nRF51 timing): the radio reads the answer about 150 us after the
+    /// END of the received packet, which on the 16 MHz Cortex-M0 is about
+    /// 2,200 cycles for all of this, with the CCM encryption, against the
+    /// four to five times as many of the nRF52832. Measure the slack on
+    /// hardware; if it is short, seal the answer ahead and patch only the
+    /// header flags here, which the MIC does not cover, and arm the next
+    /// reception while sending.
     fn respond(
         &mut self,
         radio: &mut Radio<'_>,

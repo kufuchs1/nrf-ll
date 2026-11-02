@@ -21,8 +21,18 @@ const ANOMALY_182_BIT: u32 = 1 << 10;
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
 const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
+/// Largest advertising channel payload the radio accepts: as on the data
+/// channels.
+pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
+/// Busy-wait iterations for a decryption to finish after the packet end,
+/// about 250 us at 64 MHz.
+pub const DECRYPT_WAIT: u32 = 2000;
 /// Largest payload the radio accepts on any channel.
-pub const MAX_PAYLOAD: u8 = 255;
+const MAX_PAYLOAD: u8 = 255;
+/// Whether the radio has LE 2M.
+pub const PHY_2M: bool = true;
+/// Receiver ready time after RXEN with fast ramp-up.
+pub const RX_READY_US: u32 = 40;
 
 /// Sets the CCM mode for a packet on `phy`, in the extended length mode.
 #[inline]
