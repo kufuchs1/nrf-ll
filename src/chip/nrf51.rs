@@ -2,23 +2,43 @@
 //! ramp-up, the 5-bit length field the CCM needs on the data channels, and a
 //! second PPI channel in place of the FORK the nRF51 lacks.
 //!
-//! Of the nRF51 workarounds only the radio trim is applied here.
+//! The clock sources of the board come from the firmware: the crystal
+//! frequency, which CLOCK.XTALFREQ must match, and whether the low frequency
+//! clock is the RC oscillator or a crystal, which sets the sleep clock
+//! accuracy.
+//!
+//! Of the nRF51 workarounds only the radio trim and the sign of the
+//! temperature are applied here.
 //! TODO(errata): check the nRF51802 errata document (it derives from the
 //! nRF51822 revision 3 PANs) before adding any other workaround, among them
-//! the TIMER events lost with PPI and invalid RTC reads right after its start.
+//! the TIMER events lost with PPI, invalid RTC reads right after its start,
+//! and the temperature offset that the nRF51 SDK writes to 0x4000_C504.
 
-use crate::radio::{LENGTH_BITS, Phy};
+use crate::{
+    clock::{HighFrequency, LowFrequency, RC_PPM},
+    radio::{LENGTH_BITS, Phy},
+};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_nrf::pac::{
     CCM,
+    CLOCK,
     FICR,
     PPI,
     RADIO,
     TEMP,
     ccm::vals::Mode as CcmMode,
+    clock::vals::Xtalfreq,
     ficr::vals::Ble1mbit,
     radio::vals::{Mode, Txpower},
 };
 
+/// Time the high frequency crystal gets to start before TIMER0 restarts, at
+/// first. TODO(datasheet): placeholders until the start-up time of the
+/// board's crystal is known; the lead follows the crystal anyway.
+pub const CRYSTAL_LEAD_US: u32 = 1500;
+/// Bounds of the crystal lead time: an nRF51 crystal starts slower than
+/// the nRF52832's.
+pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 2500);
 /// Largest advertising channel payload: 37 octets, a legacy advertising PDU.
 pub const ADV_MAXLEN: u8 = 37;
 /// Largest data channel payload: 27 octets and the four-byte MIC, as far as
@@ -46,6 +66,15 @@ pub const PHY_2M: bool = false;
 /// Zephyr's nRF51 HAL uses 138 us.
 /// TODO(datasheet): confirm it in the nRF51802 product specification.
 pub const RX_READY_US: u32 = 140;
+/// Accuracy of the low frequency clock in ppm, as configured.
+static SLEEP_CLOCK_PPM: AtomicU32 = AtomicU32::new(RC_PPM);
+/// Whether the low frequency clock is the RC oscillator, as configured.
+static SLEEP_CLOCK_RC: AtomicBool = AtomicBool::new(true);
+
+/// Whether the low frequency clock is the RC oscillator, which needs
+/// calibrating.
+#[inline]
+pub fn calibrates_rc() -> bool { SLEEP_CLOCK_RC.load(Ordering::Relaxed) }
 
 /// Sets the CCM mode for a packet. The nRF51 CCM has no data rate or length
 /// setting: it follows LE 1M and payloads of up to 27 octets.
@@ -53,6 +82,25 @@ pub const RX_READY_US: u32 = 140;
 pub fn ccm_mode(mode: CcmMode, phy: Phy) {
     debug_assert!(phy == Phy::M1, "the nRF51 has LE 1M alone");
     CCM.mode().write(|w| w.set_mode(mode));
+}
+
+/// Takes the clock sources of the board: sets the crystal frequency, which
+/// must happen before the crystal is first started, and keeps the sleep
+/// clock's accuracy.
+#[inline]
+pub fn configure_clocks(high_frequency: HighFrequency, low_frequency: LowFrequency) {
+    CLOCK.xtalfreq().write(|w| {
+        w.set_xtalfreq(match high_frequency {
+            HighFrequency::Mhz16 => Xtalfreq::_16mHz,
+            HighFrequency::Mhz32 => Xtalfreq::_32mHz,
+        });
+    });
+    let (rc, ppm) = match low_frequency {
+        LowFrequency::Crystal { ppm } => (false, u32::from(ppm)),
+        LowFrequency::Rc => (true, RC_PPM),
+    };
+    SLEEP_CLOCK_RC.store(rc, Ordering::Relaxed);
+    SLEEP_CLOCK_PPM.store(ppm, Ordering::Relaxed);
 }
 
 /// Disables PPI `channel` and the channel standing in for its FORK.
@@ -90,9 +138,12 @@ pub fn radio_trim() {
     }
 }
 
-/// The die temperature in units of 0.25 °C, once a measurement is ready.
+/// The die temperature in units of 0.25 °C, once a measurement is ready. The
+/// register holds a 10-bit two's complement value that the nRF51 does not
+/// sign-extend (PAN 28, as the nRF51 SDK handles it); extending it is right
+/// either way.
 #[inline]
-pub fn read_temperature() -> i32 { TEMP.temp().read().cast_signed() }
+pub fn read_temperature() -> i32 { temperature(TEMP.temp().read()) }
 
 /// Makes PPI `channel` disable `group` on its event: a second channel on
 /// the same event triggers the group's disable task, and both are in the
@@ -109,6 +160,13 @@ pub fn self_disabling(channel: usize, group: usize) {
         w.set_ch(fork, true);
     });
 }
+
+/// The temperature of a TEMP register value, sign-extended from its 10 bits.
+const fn temperature(raw: u32) -> i32 { raw.wrapping_shl(22).cast_signed().wrapping_shr(22) }
+
+/// Accuracy of the low frequency clock in ppm, as configured.
+#[inline]
+pub fn sleep_clock_ppm() -> u32 { SLEEP_CLOCK_PPM.load(Ordering::Relaxed) }
 
 /// Nothing to do: the RC oscillator needs no workaround around a
 /// calibration on the nRF51 (anomaly 192 is an nRF52832 erratum).
@@ -162,6 +220,14 @@ fn address<T>(register: *mut T) -> u32 { u32::try_from(register.addr()).unwrap_o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_temperature_keeps_its_sign() {
+        assert_eq!(temperature(0x064), 100);
+        assert_eq!(temperature(0x3FF), -1);
+        assert_eq!(temperature(0x3D8), -40);
+        assert_eq!(temperature(0xFFFF_FFD8), -40);
+    }
 
     #[test]
     fn a_power_between_levels_rounds_down_to_one() {

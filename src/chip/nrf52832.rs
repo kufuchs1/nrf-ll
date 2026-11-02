@@ -1,7 +1,10 @@
 //! nRF52832 register code: the errata workarounds, the fast ramp-up, LE 2M,
 //! the radio's S1 byte in RAM and the CCM's extended length mode.
 
-use crate::radio::{LENGTH_BITS, Phy};
+use crate::{
+    clock::RC_PPM,
+    radio::{LENGTH_BITS, Phy},
+};
 use core::ptr::{read_volatile, with_exposed_provenance_mut, write_volatile};
 use embassy_nrf::pac::{
     CCM,
@@ -21,6 +24,11 @@ const ANOMALY_182_BIT: u32 = 1 << 10;
 /// frequency can be off by more than 500 ppm after a calibration during
 /// which the CPU slept.
 const ANOMALY_192_REGISTER: usize = 0x4000_0C34;
+/// Time the high frequency crystal gets to start before TIMER0 restarts, at
+/// first: the 32 MHz crystal typically starts in about 360 us.
+pub const CRYSTAL_LEAD_US: u32 = 800;
+/// Bounds of the crystal lead time.
+pub const CRYSTAL_LEAD_RANGE_US: (u32, u32) = (300, 1500);
 /// Largest advertising channel payload the radio accepts: as on the data
 /// channels.
 pub const ADV_MAXLEN: u8 = MAX_PAYLOAD;
@@ -73,6 +81,11 @@ pub fn radio_trim() {
     // SAFETY: Nordic documents this write for the anomaly 182 fix.
     let () = unsafe { write_volatile(register, value | ANOMALY_182_BIT) };
 }
+
+/// Accuracy of the low frequency clock in ppm: the RC oscillator, which
+/// [`crate::clock::calibrate_rc`] keeps calibrated.
+#[inline]
+pub const fn sleep_clock_ppm() -> u32 { RC_PPM }
 
 /// The die temperature in units of 0.25 °C, once a measurement is ready.
 #[inline]

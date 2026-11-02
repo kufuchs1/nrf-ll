@@ -143,8 +143,6 @@ const PREFERRED_PHYS: u8 = if chip::PHY_2M { 0x02 } else { 0x01 };
 const REPORT_INTERVAL_US: u32 = 10_000_000;
 /// Header bit: more data follows.
 const MD: u8 = 0x10;
-/// Our sleep clock accuracy in ppm: the calibrated RC oscillator.
-const OWN_SCA_PPM: u32 = 500;
 /// Queued PDUs.
 const QUEUE_LEN: usize = 4;
 /// Radio ramp-up time.
@@ -1358,7 +1356,7 @@ impl Connection {
             merged_outcome: None,
             received: false,
             rx_plain: [0; BUFFER_LEN],
-            sca_ppm: request.sca_ppm.saturating_add(OWN_SCA_PPM),
+            sca_ppm: request.sca_ppm.saturating_add(chip::sleep_clock_ppm()),
             skipped: 0,
             sn: false,
             stats: Stats::default(),
